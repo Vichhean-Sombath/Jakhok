@@ -34,7 +34,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadHistory();
   }
 
-  String get _historyKey => 'chat_history_${widget.document.id}';
+  String get _historyKey => AppState.chatHistoryKey(widget.document.id);
 
   Future<void> _loadHistory() async {
     try {
@@ -79,6 +79,9 @@ class _ChatScreenState extends State<ChatScreen> {
             .toList(),
       ),
     );
+    if (_messages.any((message) => message.isUser)) {
+      widget.state.markChatHistory(widget.document.id);
+    }
   }
 
   @override

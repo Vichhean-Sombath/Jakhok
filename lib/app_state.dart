@@ -8,8 +8,14 @@ import 'models/document.dart';
 class AppState extends ChangeNotifier {
   static const _docsKey = 'scanned_documents_v1';
   static const _darkKey = 'dark_mode_v1';
+  static String chatHistoryKey(String documentId) => 'chat_history_$documentId';
   final List<ScannedDocument> documents = [];
+  final Set<String> _chatHistoryDocumentIds = {};
   bool isDark = false;
+
+  List<ScannedDocument> get chatHistory => documents
+      .where((document) => _chatHistoryDocumentIds.contains(document.id))
+      .toList(growable: false);
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -30,6 +36,23 @@ class AppState extends ChangeNotifier {
         documents.clear();
       }
     }
+    _chatHistoryDocumentIds
+      ..clear()
+      ..addAll(
+        documents
+            .where((document) {
+              final history = prefs.getString(chatHistoryKey(document.id));
+              if (history == null) return false;
+              try {
+                return (jsonDecode(history) as List<dynamic>).any(
+                  (row) => row is Map && row['isUser'] == true,
+                );
+              } catch (_) {
+                return false;
+              }
+            })
+            .map((document) => document.id),
+      );
   }
 
   Future<void> addDocument(ScannedDocument document) async {
@@ -40,8 +63,13 @@ class AppState extends ChangeNotifier {
 
   Future<void> deleteDocument(ScannedDocument document) async {
     documents.removeWhere((item) => item.id == document.id);
+    _chatHistoryDocumentIds.remove(document.id);
     await _save();
     notifyListeners();
+  }
+
+  void markChatHistory(String documentId) {
+    if (_chatHistoryDocumentIds.add(documentId)) notifyListeners();
   }
 
   Future<void> toggleTheme() async {

@@ -33,10 +33,24 @@ class HomeScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    drawer: _ChatHistoryDrawer(
+      state: state,
+      onChat: (document) {
+        Navigator.pop(context);
+        _chat(context, document);
+      },
+      onTheme: () {
+        Navigator.pop(context);
+        state.toggleTheme();
+      },
+    ),
     appBar: AppBar(
-      leading: IconButton(
-        icon: const Icon(Icons.menu),
-        onPressed: () => _showMenu(context),
+      leading: Builder(
+        builder: (context) => IconButton(
+          icon: const Icon(Icons.menu),
+          tooltip: 'Chat history',
+          onPressed: () => Scaffold.of(context).openDrawer(),
+        ),
       ),
       title: const Text('Documents'),
       actions: [
@@ -91,24 +105,103 @@ class HomeScreen extends StatelessWidget {
             label: const Text('Scan Document'),
           ),
   );
+}
 
-  void _showMenu(BuildContext context) {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (context) => SafeArea(
-        child: ListTile(
-          leading: Icon(
-            state.isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+class _ChatHistoryDrawer extends StatelessWidget {
+  const _ChatHistoryDrawer({
+    required this.state,
+    required this.onChat,
+    required this.onTheme,
+  });
+
+  final AppState state;
+  final ValueChanged<ScannedDocument> onChat;
+  final VoidCallback onTheme;
+
+  @override
+  Widget build(BuildContext context) => Drawer(
+    child: SafeArea(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 18, 16, 16),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Chat history',
+                    style: TextStyle(fontSize: 19, fontWeight: FontWeight.w600),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Close sidebar',
+                  onPressed: () => Navigator.pop(context),
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
           ),
-          title: Text(state.isDark ? 'Light appearance' : 'Dark appearance'),
-          onTap: () {
-            Navigator.pop(context);
-            state.toggleTheme();
-          },
-        ),
+          const Divider(height: 1),
+          Expanded(
+            child: state.chatHistory.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        'Your chats will appear here after you ask a question about a document.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Color(0xFF8E8E8E), height: 1.5),
+                      ),
+                    ),
+                  )
+                : ListView(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.fromLTRB(20, 8, 16, 8),
+                        child: Text(
+                          'RECENT',
+                          style: TextStyle(
+                            color: Color(0xFF8E8E8E),
+                            fontSize: 11,
+                            letterSpacing: 1,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      for (final document in state.chatHistory)
+                        ListTile(
+                          leading: const Icon(
+                            Icons.chat_bubble_outline_rounded,
+                          ),
+                          title: Text(
+                            document.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Text(
+                            '${document.createdAt.day.toString().padLeft(2, '0')}/${document.createdAt.month.toString().padLeft(2, '0')}/${document.createdAt.year}',
+                          ),
+                          onTap: () => onChat(document),
+                        ),
+                    ],
+                  ),
+          ),
+          const Divider(height: 1),
+          ListTile(
+            leading: Icon(
+              state.isDark
+                  ? Icons.light_mode_outlined
+                  : Icons.dark_mode_outlined,
+            ),
+            title: Text(state.isDark ? 'Light appearance' : 'Dark appearance'),
+            onTap: onTheme,
+          ),
+        ],
       ),
-    );
-  }
+    ),
+  );
 }
 
 class _EmptyState extends StatelessWidget {
