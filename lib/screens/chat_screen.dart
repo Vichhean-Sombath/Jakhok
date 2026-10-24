@@ -11,9 +11,19 @@ import '../widgets/message_bubble.dart';
 import 'scan_screen.dart';
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, required this.document, required this.state});
-  final ScannedDocument document;
+  const ChatScreen({
+    super.key,
+    this.document,
+    this.conversationId,
+    required this.state,
+    this.initialQuestion,
+    this.showExtractedText = false,
+  });
+  final ScannedDocument? document;
+  final String? conversationId;
   final AppState state;
+  final String? initialQuestion;
+  final bool showExtractedText;
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
@@ -34,7 +44,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadHistory();
   }
 
-  String get _historyKey => AppState.chatHistoryKey(widget.document.id);
+  String get _conversationId => widget.document?.id ?? widget.conversationId!;
+  String get _historyKey => AppState.chatHistoryKey(_conversationId);
 
   Future<void> _loadHistory() async {
     try {
@@ -57,14 +68,37 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (_) {
       _messages.clear();
     }
-    if (_messages.isEmpty) _addWelcomeMessage();
-    if (mounted) setState(() => _loadingHistory = false);
+    final isNewConversation = _messages.isEmpty;
+    if (isNewConversation) {
+      _addWelcomeMessage();
+      final document = widget.document;
+      if (widget.showExtractedText && document != null) {
+        _messages.add(
+          ChatMessage(
+            text:
+                'Here’s the text I extracted from **${document.name}**:\n\n'
+                '```text\n${document.text}\n```',
+            isUser: false,
+          ),
+        );
+      }
+    }
+    if (mounted) {
+      setState(() => _loadingHistory = false);
+      final initialQuestion = widget.initialQuestion?.trim();
+      if (initialQuestion != null && initialQuestion.isNotEmpty) {
+        await _send(initialQuestion);
+      } else if (isNewConversation && widget.showExtractedText) {
+        await _saveHistory();
+      }
+    }
   }
 
   void _addWelcomeMessage() => _messages.add(
     ChatMessage(
-      text:
-          'I’ve read **${widget.document.name}**. What would you like to know about it?',
+      text: widget.document == null
+          ? 'Hi! What would you like to talk about?'
+          : 'I’ve read **${widget.document!.name}**. What would you like to know about it?',
       isUser: false,
     ),
   );
@@ -80,7 +114,15 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
     if (_messages.any((message) => message.isUser)) {
-      widget.state.markChatHistory(widget.document.id);
+      if (widget.document != null) {
+        widget.state.markChatHistory(widget.document!.id);
+      } else {
+        final firstQuestion = _messages.firstWhere((message) => message.isUser);
+        final title = firstQuestion.text.length > 42
+            ? '${firstQuestion.text.substring(0, 39)}…'
+            : firstQuestion.text;
+        await widget.state.saveGeneralChat(_conversationId, title);
+      }
     }
   }
 
@@ -118,10 +160,21 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _mockAnswer(String question) {
-    final text = [
-      widget.document,
+    final documents = [
+      if (widget.document != null) widget.document!,
       ..._attachedDocuments,
-    ].map((document) => '${document.name}\n${document.text}').join('\n\n');
+    ];
+    final text = documents
+        .map((document) => '${document.name}\n${document.text}')
+        .join('\n\n');
+    if (text.trim().isEmpty) {
+      final prefix = _search
+          ? 'Search mode is selected. '
+          : _deepThink
+          ? 'DeepThink mode is selected. '
+          : '';
+      return '${prefix}This is a local chat preview. Connect an AI service to generate answers to general questions. You said: “$question”';
+    }
     final excerpt = text.length > 320 ? '${text.substring(0, 320)}…' : text;
     final lower = question.toLowerCase();
     if (lower.contains('summar'))
@@ -148,6 +201,17 @@ class _ChatScreenState extends State<ChatScreen> {
   });
 
   void _newChat() {
+    if (widget.document == null) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            state: widget.state,
+            conversationId: DateTime.now().microsecondsSinceEpoch.toString(),
+          ),
+        ),
+      );
+      return;
+    }
     _attachedDocuments.clear();
     setState(() {
       _messages..clear();
@@ -192,7 +256,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || choice == null) return;
     if (choice == 'existing') {
       final docs = widget.state.documents
-          .where((doc) => doc.id != widget.document.id)
+          .where((doc) => doc.id != widget.document?.id)
           .toList();
       if (docs.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -241,7 +305,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _appendDocument(ScannedDocument doc) {
-    if (doc.id != widget.document.id &&
+    if (doc.id != widget.document?.id &&
         !_attachedDocuments.any((attached) => attached.id == doc.id)) {
       _attachedDocuments.add(doc);
     }
@@ -269,16 +333,17 @@ class _ChatScreenState extends State<ChatScreen> {
         mainAxisSize: MainAxisSize.min,
         children: [
           const Text('Chat', style: TextStyle(fontSize: 16)),
-          Text(
-            widget.document.name,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Color(0xFF8E8E8E),
-              fontSize: 11,
-              fontWeight: FontWeight.normal,
+          if (widget.document != null)
+            Text(
+              widget.document!.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Color(0xFF8E8E8E),
+                fontSize: 11,
+                fontWeight: FontWeight.normal,
+              ),
             ),
-          ),
         ],
       ),
       actions: [
@@ -313,6 +378,10 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         Composer(
           controller: _controller,
+          hintText: widget.document == null
+              ? 'Message'
+              : 'Ask about this document…',
+          showModes: widget.document != null,
           deepThink: _deepThink,
           search: _search,
           onDeepThink: () => setState(() => _deepThink = !_deepThink),
@@ -337,11 +406,18 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ),
       const SizedBox(height: 25),
-      for (final prompt in [
-        'Summarize this document',
-        'What are the key points?',
-        'Translate to Spanish',
-      ])
+      for (final prompt
+          in widget.document == null
+              ? [
+                  'Help me brainstorm an idea',
+                  'Explain a topic simply',
+                  'Draft a short message',
+                ]
+              : [
+                  'Summarize this document',
+                  'What are the key points?',
+                  'Translate to Spanish',
+                ])
         Padding(
           padding: const EdgeInsets.only(bottom: 10),
           child: OutlinedButton(

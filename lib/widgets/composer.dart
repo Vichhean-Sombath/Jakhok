@@ -13,6 +13,8 @@ class Composer extends StatelessWidget {
     required this.onAttach,
     required this.onSend,
     required this.enabled,
+    this.hintText = 'Ask about this document…',
+    this.showModes = true,
   });
   final TextEditingController controller;
   final bool deepThink;
@@ -22,6 +24,8 @@ class Composer extends StatelessWidget {
   final VoidCallback onAttach;
   final VoidCallback onSend;
   final bool enabled;
+  final String hintText;
+  final bool showModes;
 
   @override
   Widget build(BuildContext context) {
@@ -42,23 +46,24 @@ class Composer extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Row(
-                children: [
-                  _ModeChip(
-                    icon: Icons.psychology_outlined,
-                    title: 'DeepThink',
-                    active: deepThink,
-                    onTap: onDeepThink,
-                  ),
-                  const SizedBox(width: 8),
-                  _ModeChip(
-                    icon: Icons.public,
-                    title: 'Search',
-                    active: search,
-                    onTap: onSearch,
-                  ),
-                ],
-              ),
+              if (showModes)
+                Row(
+                  children: [
+                    _ModeChip(
+                      icon: Icons.psychology_outlined,
+                      title: 'DeepThink',
+                      active: deepThink,
+                      onTap: onDeepThink,
+                    ),
+                    const SizedBox(width: 8),
+                    _ModeChip(
+                      icon: Icons.public,
+                      title: 'Search',
+                      active: search,
+                      onTap: onSearch,
+                    ),
+                  ],
+                ),
               TextField(
                 controller: controller,
                 enabled: enabled,
@@ -68,8 +73,8 @@ class Composer extends StatelessWidget {
                 onSubmitted: (_) {
                   if (controller.text.trim().isNotEmpty && enabled) onSend();
                 },
-                decoration: const InputDecoration(
-                  hintText: 'Ask about this document…',
+                decoration: InputDecoration(
+                  hintText: hintText,
                   border: InputBorder.none,
                   contentPadding: EdgeInsets.symmetric(vertical: 12),
                   isDense: true,

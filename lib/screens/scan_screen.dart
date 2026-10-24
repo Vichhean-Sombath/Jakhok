@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
@@ -13,8 +14,11 @@ import 'package:pdfx/pdfx.dart';
 import '../app_state.dart';
 import '../models/document.dart';
 import '../services/file_text_extractor.dart';
+import '../services/image_ocr_stub.dart'
+    if (dart.library.html) '../services/image_ocr_web.dart'
+    as web_image_ocr;
 import '../widgets/scan_overlay.dart';
-import 'detail_screen.dart';
+import 'chat_screen.dart';
 
 class ScanScreen extends StatefulWidget {
   const ScanScreen({
@@ -22,10 +26,12 @@ class ScanScreen extends StatefulWidget {
     required this.state,
     this.returnToCaller = false,
     this.openGalleryInitially = false,
+    this.openFilePickerInitially = false,
   });
   final AppState state;
   final bool returnToCaller;
   final bool openGalleryInitially;
+  final bool openFilePickerInitially;
   @override
   State<ScanScreen> createState() => _ScanScreenState();
 }
@@ -33,6 +39,7 @@ class ScanScreen extends StatefulWidget {
 class _ScanScreenState extends State<ScanScreen> {
   CameraController? _camera;
   File? _image;
+  Uint8List? _imageBytes;
   String? _documentName;
   List<int>? _documentBytes;
   bool _cameraUnavailable = false;
@@ -40,10 +47,14 @@ class _ScanScreenState extends State<ScanScreen> {
   bool _flash = false;
   String? _error;
 
+  bool get _hasImage => _image != null || _imageBytes != null;
+
   @override
   void initState() {
     super.initState();
-    if (widget.openGalleryInitially) {
+    if (widget.openFilePickerInitially) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _pickFile());
+    } else if (widget.openGalleryInitially) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _gallery());
     } else {
       _initializeCamera();
@@ -112,13 +123,16 @@ class _ScanScreenState extends State<ScanScreen> {
   Future<void> _capture() async {
     try {
       final shot = await _camera?.takePicture();
-      if (shot != null && mounted)
+      if (shot != null && mounted) {
+        final bytes = await shot.readAsBytes();
         setState(() {
           _image = File(shot.path);
+          _imageBytes = bytes;
           _documentName = null;
           _documentBytes = null;
           _error = null;
         });
+      }
     } catch (_) {
       if (mounted)
         setState(
@@ -134,13 +148,16 @@ class _ScanScreenState extends State<ScanScreen> {
         source: ImageSource.gallery,
         imageQuality: 92,
       );
-      if (picked != null && mounted)
+      if (picked != null && mounted) {
+        final bytes = await picked.readAsBytes();
         setState(() {
-          _image = File(picked.path);
+          _image = kIsWeb ? null : File(picked.path);
+          _imageBytes = bytes;
           _documentName = null;
           _documentBytes = null;
           _error = null;
         });
+      }
     } catch (_) {
       if (mounted) setState(() => _error = 'Could not open the photo library.');
     }
@@ -179,8 +196,8 @@ class _ScanScreenState extends State<ScanScreen> {
       }
       final bytes = await picked.readAsBytes();
       if (_isImageFile(extension, bytes)) {
-        var path = picked.path;
-        if (path == null) {
+        var path = kIsWeb ? null : picked.path;
+        if (path == null && !kIsWeb) {
           final tempDirectory = await getTemporaryDirectory();
           final imageFile = File(
             '${tempDirectory.path}/picked_${DateTime.now().microsecondsSinceEpoch}.$extension',
@@ -188,9 +205,9 @@ class _ScanScreenState extends State<ScanScreen> {
           await imageFile.writeAsBytes(bytes, flush: true);
           path = imageFile.path;
         }
-        final imagePath = path;
         setState(() {
-          _image = File(imagePath);
+          _image = path == null ? null : File(path);
+          _imageBytes = Uint8List.fromList(bytes);
           _documentName = null;
           _documentBytes = null;
           _error = null;
@@ -198,6 +215,7 @@ class _ScanScreenState extends State<ScanScreen> {
       } else {
         setState(() {
           _image = null;
+          _imageBytes = null;
           _documentName = picked.name;
           _documentBytes = bytes;
           _error = null;
@@ -255,7 +273,7 @@ class _ScanScreenState extends State<ScanScreen> {
           bytes[3] == 0x46);
 
   Future<void> _extract() async {
-    if ((_image == null && _documentBytes == null) || _busy) return;
+    if ((!_hasImage && _documentBytes == null) || _busy) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -263,12 +281,22 @@ class _ScanScreenState extends State<ScanScreen> {
     TextRecognizer? recognizer;
     try {
       String text;
-      if (_image != null) {
-        recognizer = TextRecognizer(script: TextRecognitionScript.latin);
-        final result = await recognizer.processImage(
-          InputImage.fromFilePath(_image!.path),
-        );
-        text = result.text.trim();
+      if (_hasImage) {
+        if (kIsWeb) {
+          text = (await web_image_ocr.recognizeImage(_imageBytes!)).trim();
+        } else {
+          final image = _image;
+          if (image == null) {
+            throw UnsupportedError(
+              'Image OCR is unavailable on this platform.',
+            );
+          }
+          recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+          final result = await recognizer.processImage(
+            InputImage.fromFilePath(image.path),
+          );
+          text = result.text.trim();
+        }
       } else {
         if (_isPdfFile(_documentName!, _documentBytes!)) {
           final pageTexts = await FileTextExtractor.extractPdfPages(
@@ -293,7 +321,7 @@ class _ScanScreenState extends State<ScanScreen> {
       }
       if (text.isEmpty) {
         setState(() {
-          _error = _image != null
+          _error = _hasImage
               ? 'No text found in image. Try another image or retake the photo.'
               : 'No readable text found in this file. Check that its pages are clear and readable.';
           _busy = false;
@@ -328,7 +356,11 @@ class _ScanScreenState extends State<ScanScreen> {
       }
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
-          builder: (_) => DetailScreen(document: doc, state: widget.state),
+          builder: (_) => ChatScreen(
+            document: doc,
+            state: widget.state,
+            showExtractedText: true,
+          ),
         ),
       );
     } on UnsupportedError catch (error) {
@@ -343,8 +375,9 @@ class _ScanScreenState extends State<ScanScreen> {
     } catch (_) {
       if (mounted)
         setState(() {
-          _error =
-              'Couldn’t read this file. Import an image, PDF, Office document, text file, EPUB, subtitle, or ZIP archive.';
+          _error = kIsWeb && _hasImage
+              ? 'Could not recognize text in this image. Check your connection and try again.'
+              : 'Couldn’t read this file. Import an image, PDF, Office document, text file, EPUB, subtitle, or ZIP archive.';
           _busy = false;
         });
     } finally {
@@ -406,8 +439,10 @@ class _ScanScreenState extends State<ScanScreen> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          if (_image != null)
-            Image.file(_image!, fit: BoxFit.contain)
+          if (_hasImage)
+            _imageBytes != null
+                ? Image.memory(_imageBytes!, fit: BoxFit.contain)
+                : Image.file(_image!, fit: BoxFit.contain)
           else if (_documentName != null)
             Center(
               child: Padding(
@@ -466,7 +501,7 @@ class _ScanScreenState extends State<ScanScreen> {
                 ),
               ),
             ),
-          if (_image == null && !_cameraUnavailable) ...[
+          if (!_hasImage && !_cameraUnavailable) ...[
             const ScanOverlay(),
             const Positioned(
               top: 25,
@@ -492,7 +527,7 @@ class _ScanScreenState extends State<ScanScreen> {
               icon: const Icon(Icons.close, color: Colors.white),
             ),
           ),
-          if (_image != null || _documentBytes != null)
+          if (_hasImage || _documentBytes != null)
             Positioned(
               left: 20,
               right: 20,
@@ -502,6 +537,7 @@ class _ScanScreenState extends State<ScanScreen> {
                   TextButton(
                     onPressed: () => setState(() {
                       _image = null;
+                      _imageBytes = null;
                       _documentName = null;
                       _documentBytes = null;
                     }),
@@ -602,7 +638,7 @@ class _ScanScreenState extends State<ScanScreen> {
             Positioned(
               left: 16,
               right: 16,
-              bottom: _image == null && _documentBytes == null ? 115 : 88,
+              bottom: !_hasImage && _documentBytes == null ? 115 : 88,
               child: Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(

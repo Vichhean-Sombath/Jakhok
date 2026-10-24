@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 class AppTheme {
   // Change this single token to update active chips and selection accents.
-  static const accent = Color(0xFF6C8CE4);
+  static Color accent = const Color(0xFF3563F5);
   static const lightBg = Color(0xFFFFFFFF);
   static const darkBg = Color(0xFF1A1A1A);
   static const primary = Color(0xFF1F1F1F);

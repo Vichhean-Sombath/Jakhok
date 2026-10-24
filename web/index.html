@@ -31,6 +31,28 @@
 
   <title>khmer_ocr_flutter</title>
   <link rel="manifest" href="manifest.json">
+  <script>
+    window.recognizeImageWithTesseract = async function (bytes) {
+      if (!window.Tesseract) {
+        window.__tesseractLoad ??= new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('Could not load the web OCR engine.'));
+          document.head.appendChild(script);
+        });
+        await window.__tesseractLoad;
+      }
+      const worker = await window.Tesseract.createWorker('khm+eng', 1);
+      try {
+        const image = new Blob([new Uint8Array(bytes)]);
+        const result = await worker.recognize(image);
+        return result.data.text || '';
+      } finally {
+        await worker.terminate();
+      }
+    };
+  </script>
 </head>
 <body>
   <!--
