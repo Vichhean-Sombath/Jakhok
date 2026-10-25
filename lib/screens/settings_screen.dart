@@ -96,7 +96,7 @@ class SettingsScreen extends StatelessWidget {
                     onTap: () => _showInfo(
                       context,
                       'General',
-                      'Khmer OCR is an offline first document scanner with local text extraction and chat previews.',
+                      'Jakhok is an offline first document scanner with local text extraction and chat previews.',
                     ),
                   ),
                   _SettingDivider(),
@@ -122,10 +122,10 @@ class SettingsScreen extends StatelessWidget {
                   _SettingDivider(),
                   _SettingRow(
                     icon: Icons.info_outline_rounded,
-                    title: 'About Khmer OCR',
+                    title: 'About Jakhok',
                     onTap: () => showAboutDialog(
                       context: context,
-                      applicationName: 'Khmer OCR',
+                      applicationName: 'Jakhok',
                       applicationVersion: '1.0.0',
                       applicationIcon: const Icon(Icons.document_scanner),
                     ),

@@ -18,6 +18,7 @@ class AppTheme {
     final bg = dark ? darkBg : lightBg;
     return ThemeData(
       useMaterial3: true,
+      fontFamily: 'KhmerOSSiemReap',
       brightness: brightness,
       scaffoldBackgroundColor: bg,
       colorScheme: ColorScheme.fromSeed(
@@ -41,9 +42,16 @@ class AppTheme {
       ),
       dividerColor: dark ? const Color(0xFF333333) : border,
       iconTheme: IconThemeData(color: fg),
+      textSelectionTheme: const TextSelectionThemeData(
+        cursorColor: Colors.white,
+      ),
       textTheme: ThemeData(
         brightness: brightness,
-      ).textTheme.apply(bodyColor: fg, displayColor: fg, fontFamily: 'Inter'),
+      ).textTheme.apply(
+        bodyColor: fg,
+        displayColor: fg,
+        fontFamily: 'KhmerOSSiemReap',
+      ),
       floatingActionButtonTheme: FloatingActionButtonThemeData(
         backgroundColor: dark ? Colors.white : Colors.black,
         foregroundColor: dark ? Colors.black : Colors.white,

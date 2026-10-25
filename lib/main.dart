@@ -19,7 +19,7 @@ class ScannerApp extends StatelessWidget {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: state,
     builder: (context, _) => MaterialApp(
-      title: 'Documents',
+      title: 'Jakhok',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
       darkTheme: AppTheme.dark,

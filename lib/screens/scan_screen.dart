@@ -25,11 +25,13 @@ class ScanScreen extends StatefulWidget {
     super.key,
     required this.state,
     this.returnToCaller = false,
+    this.openCameraInitially = false,
     this.openGalleryInitially = false,
     this.openFilePickerInitially = false,
   });
   final AppState state;
   final bool returnToCaller;
+  final bool openCameraInitially;
   final bool openGalleryInitially;
   final bool openFilePickerInitially;
   @override
@@ -44,6 +46,7 @@ class _ScanScreenState extends State<ScanScreen> {
   List<int>? _documentBytes;
   bool _cameraUnavailable = false;
   bool _busy = false;
+  String? _ocrStatus;
   bool _flash = false;
   String? _error;
 
@@ -56,9 +59,55 @@ class _ScanScreenState extends State<ScanScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) => _pickFile());
     } else if (widget.openGalleryInitially) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _gallery());
+    } else if (widget.openCameraInitially && !kIsWeb) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _takeSystemPhoto());
     } else {
       _initializeCamera();
     }
+  }
+
+  Future<void> _takeSystemPhoto() async {
+    final hadImage = _hasImage;
+    try {
+      final picked = await ImagePicker().pickImage(
+        source: ImageSource.camera,
+        imageQuality: 92,
+      );
+      if (!mounted) return;
+      if (picked == null) {
+        if (!hadImage) Navigator.of(context).pop();
+        return;
+      }
+      final bytes = await picked.readAsBytes();
+      if (!mounted) return;
+      setState(() {
+        _image = File(picked.path);
+        _imageBytes = bytes;
+        _documentName = null;
+        _documentBytes = null;
+        _error = null;
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _cameraUnavailable = true;
+          _error = 'Camera not available. Choose a photo or upload a file.';
+        });
+      }
+    }
+  }
+
+  void _retake() {
+    if (widget.openCameraInitially && !kIsWeb) {
+      _takeSystemPhoto();
+      return;
+    }
+    setState(() {
+      _image = null;
+      _imageBytes = null;
+      _documentName = null;
+      _documentBytes = null;
+    });
   }
 
   Future<void> _initializeCamera() async {
@@ -276,6 +325,7 @@ class _ScanScreenState extends State<ScanScreen> {
     if ((!_hasImage && _documentBytes == null) || _busy) return;
     setState(() {
       _busy = true;
+      _ocrStatus = 'Preparing OCR…';
       _error = null;
     });
     TextRecognizer? recognizer;
@@ -283,7 +333,12 @@ class _ScanScreenState extends State<ScanScreen> {
       String text;
       if (_hasImage) {
         if (kIsWeb) {
-          text = (await web_image_ocr.recognizeImage(_imageBytes!)).trim();
+          text = (await web_image_ocr.recognizeImage(
+            _imageBytes!,
+            onProgress: (status) {
+              if (mounted) setState(() => _ocrStatus = _friendlyOcrStatus(status));
+            },
+          )).trim();
         } else {
           final image = _image;
           if (image == null) {
@@ -325,6 +380,7 @@ class _ScanScreenState extends State<ScanScreen> {
               ? 'No text found in image. Try another image or retake the photo.'
               : 'No readable text found in this file. Check that its pages are clear and readable.';
           _busy = false;
+          _ocrStatus = null;
         });
         return;
       }
@@ -347,6 +403,7 @@ class _ScanScreenState extends State<ScanScreen> {
         createdAt: now,
         imagePath: savedImagePath,
         text: text,
+        imageBytes: _imageBytes,
       );
       await widget.state.addDocument(doc);
       if (!mounted) return;
@@ -370,6 +427,7 @@ class _ScanScreenState extends State<ScanScreen> {
               error.message?.toString() ??
               'This file type is not supported for text extraction.';
           _busy = false;
+          _ocrStatus = null;
         });
       }
     } catch (_) {
@@ -379,10 +437,23 @@ class _ScanScreenState extends State<ScanScreen> {
               ? 'Could not recognize text in this image. Check your connection and try again.'
               : 'Couldn’t read this file. Import an image, PDF, Office document, text file, EPUB, subtitle, or ZIP archive.';
           _busy = false;
+          _ocrStatus = null;
         });
     } finally {
       await recognizer?.close();
     }
+  }
+
+  String _friendlyOcrStatus(String status) {
+    final value = status.toLowerCase();
+    if (value.contains('traineddata') || value.contains('language')) {
+      return 'Loading language data…';
+    }
+    if (value.contains('recogniz')) return 'Reading text…';
+    if (value.contains('core') || value.contains('initializ')) {
+      return 'Preparing OCR…';
+    }
+    return 'Processing image…';
   }
 
   Future<String> _extractScannedPdf(
@@ -535,12 +606,7 @@ class _ScanScreenState extends State<ScanScreen> {
               child: Row(
                 children: [
                   TextButton(
-                    onPressed: () => setState(() {
-                      _image = null;
-                      _imageBytes = null;
-                      _documentName = null;
-                      _documentBytes = null;
-                    }),
+                    onPressed: _retake,
                     child: const Text(
                       'Retake',
                       style: TextStyle(color: Colors.white, fontSize: 16),
@@ -555,10 +621,24 @@ class _ScanScreenState extends State<ScanScreen> {
                       minimumSize: const Size(160, 48),
                     ),
                     child: _busy
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
+                        ? Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                _ocrStatus ?? 'Working…',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                            ],
                           )
                         : const Text('Extract Text'),
                   ),

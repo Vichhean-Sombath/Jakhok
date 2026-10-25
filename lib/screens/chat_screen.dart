@@ -30,9 +30,11 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _controller = TextEditingController();
+  final _composerFocusNode = FocusNode();
   final _scroll = ScrollController();
   final List<ChatMessage> _messages = [];
   final List<ScannedDocument> _attachedDocuments = [];
+  ChatMessage? _replyingTo;
   bool _deepThink = false;
   bool _search = false;
   bool _streaming = false;
@@ -129,8 +131,14 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     _controller.dispose();
+    _composerFocusNode.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _replyToMessage(ChatMessage message) {
+    setState(() => _replyingTo = message);
+    _composerFocusNode.requestFocus();
   }
 
   Future<void> _send([String? preset]) async {
@@ -139,6 +147,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _messages.add(ChatMessage(text: question, isUser: true));
       _controller.clear();
+      _replyingTo = null;
       _streaming = true;
     });
     _scrollToEnd();
@@ -214,6 +223,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _attachedDocuments.clear();
     setState(() {
+      _replyingTo = null;
       _messages..clear();
       _addWelcomeMessage();
     });
@@ -363,8 +373,10 @@ class _ChatScreenState extends State<ChatScreen> {
                   controller: _scroll,
                   padding: const EdgeInsets.fromLTRB(16, 22, 16, 20),
                   itemCount: _messages.length,
-                  itemBuilder: (context, index) =>
-                      MessageBubble(message: _messages[index]),
+                  itemBuilder: (context, index) => MessageBubble(
+                    message: _messages[index],
+                    onReply: _replyToMessage,
+                  ),
                 ),
         ),
         if (_loadingHistory)
@@ -378,6 +390,9 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         Composer(
           controller: _controller,
+          focusNode: _composerFocusNode,
+          replyToText: _replyingTo?.text,
+          onCancelReply: () => setState(() => _replyingTo = null),
           hintText: widget.document == null
               ? 'Message'
               : 'Ask about this document…',

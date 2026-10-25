@@ -28,3 +28,7 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  fonts:
+    - family: KhmerOSSiemReap
+      fonts:
+        - asset: assets/fonts/KhmerOSSiemreap.ttf

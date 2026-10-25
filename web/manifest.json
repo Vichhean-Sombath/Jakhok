@@ -1,11 +1,11 @@
 {
-    "name": "khmer_ocr_flutter",
-    "short_name": "khmer_ocr_flutter",
+    "name": "Jakhok",
+    "short_name": "Jakhok",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "Jakhok document scanner and chat.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

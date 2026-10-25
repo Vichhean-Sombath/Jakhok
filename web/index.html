@@ -23,16 +23,16 @@
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="khmer_ocr_flutter">
+  <meta name="apple-mobile-web-app-title" content="Jakhok">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>khmer_ocr_flutter</title>
+  <title>Jakhok</title>
   <link rel="manifest" href="manifest.json">
   <script>
-    window.recognizeImageWithTesseract = async function (bytes) {
+    window.recognizeImageWithTesseract = async function (base64Image) {
       if (!window.Tesseract) {
         window.__tesseractLoad ??= new Promise((resolve, reject) => {
           const script = document.createElement('script');
@@ -43,13 +43,33 @@
         });
         await window.__tesseractLoad;
       }
-      const worker = await window.Tesseract.createWorker('khm+eng', 1);
+      if (!window.__tesseractWorker) {
+        window.__tesseractWorker = window.Tesseract.createWorker(
+          'khm+eng',
+          1,
+          {
+            logger: (message) => {
+              if (typeof window.onOcrProgress === 'function') {
+                window.onOcrProgress(message.status, message.progress);
+              }
+            },
+          },
+        ).catch((error) => {
+          window.__tesseractWorker = null;
+          throw error;
+        });
+      }
+      const worker = await window.__tesseractWorker;
+      const image = await fetch(
+        `data:application/octet-stream;base64,${base64Image}`,
+      ).then((response) => response.blob());
       try {
-        const image = new Blob([new Uint8Array(bytes)]);
         const result = await worker.recognize(image);
         return result.data.text || '';
-      } finally {
+      } catch (error) {
+        window.__tesseractWorker = null;
         await worker.terminate();
+        throw error;
       }
     };
   </script>

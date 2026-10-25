@@ -1,24 +1,56 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 
+import '../models/document.dart';
+
 class ChatMessage {
   ChatMessage({
     required this.text,
     required this.isUser,
     this.streaming = false,
+    this.attachment,
   });
   String text;
   final bool isUser;
   bool streaming;
+  final ScannedDocument? attachment;
 }
 
 class MessageBubble extends StatelessWidget {
-  const MessageBubble({super.key, required this.message});
+  const MessageBubble({super.key, required this.message, this.onReply});
   final ChatMessage message;
+  final ValueChanged<ChatMessage>? onReply;
 
   @override
   Widget build(BuildContext context) {
     if (message.isUser) {
+      final imageBytes = message.attachment?.imageBytes;
+      if (imageBytes != null) {
+        return Align(
+          alignment: Alignment.centerRight,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 220, maxHeight: 260),
+            margin: const EdgeInsets.only(bottom: 18),
+            decoration: BoxDecoration(
+              color: const Color(0xFF242424),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Image.memory(
+              imageBytes,
+              fit: BoxFit.contain,
+              errorBuilder: (context, error, stackTrace) => const SizedBox(
+                width: 180,
+                height: 180,
+                child: Icon(Icons.broken_image_outlined),
+              ),
+            ),
+          ),
+        );
+      }
+      final messageText = message.text.isEmpty && message.attachment != null
+          ? 'Uploaded ${message.attachment!.name}'
+          : message.text;
       return Align(
         alignment: Alignment.centerRight,
         child: Container(
@@ -32,7 +64,7 @@ class MessageBubble extends StatelessWidget {
             borderRadius: BorderRadius.circular(18),
           ),
           child: Text(
-            message.text,
+            messageText,
             style: const TextStyle(fontSize: 16, height: 1.45),
           ),
         ),
@@ -48,9 +80,34 @@ class MessageBubble extends StatelessWidget {
             child: Icon(Icons.auto_awesome, size: 16),
           ),
           Expanded(
-            child: _AssistantText(
-              text: message.text,
-              streaming: message.streaming,
+            child: FractionallySizedBox(
+              widthFactor: .82,
+              alignment: Alignment.topLeft,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _AssistantText(
+                    text: message.text,
+                    streaming: message.streaming,
+                  ),
+                  if (!message.streaming && message.text.trim().isNotEmpty)
+                    TextButton(
+                      onPressed: onReply == null ? null : () => onReply!(message),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.white60,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        minimumSize: const Size(0, 32),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      child: const Text('Reply', style: TextStyle(fontSize: 13)),
+                    ),
+                ],
+              ),
             ),
           ),
         ],
@@ -95,8 +152,8 @@ class _AssistantText extends StatelessWidget {
           else
             Container(
               width: double.infinity,
-              margin: const EdgeInsets.symmetric(vertical: 9),
-              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.symmetric(vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
               decoration: BoxDecoration(
                 color: Theme.of(context).brightness == Brightness.dark
                     ? const Color(0xFF262626)
