@@ -30,6 +30,7 @@ class _HomeScreenState extends State<HomeScreen> {
   final _generalScrollController = ScrollController();
   final List<ChatMessage> _generalMessages = [];
   ChatMessage? _replyingTo;
+  ScannedDocument? _pendingAttachment;
   String? _activeGeneralChatId;
   ScannedDocument? _activeDocument;
   bool _generalStreaming = false;
@@ -56,7 +57,10 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
-    if (document != null && mounted) await _showDocumentResult(document);
+    if (document != null && mounted) {
+      setState(() => _pendingAttachment = document);
+      _messageFocusNode.requestFocus();
+    }
   }
 
   Future<void> _showAttachmentMenu() async {
@@ -141,20 +145,21 @@ class _HomeScreenState extends State<HomeScreen> {
       if (raw != null) {
         messages = (jsonDecode(raw) as List<dynamic>).map((row) {
           final item = row as Map<String, dynamic>;
-          final attachmentId = item['attachmentDocumentId'] as String?;
-          ScannedDocument? attachment;
-          if (attachmentId != null) {
-            for (final document in state.documents) {
-              if (document.id == attachmentId) {
-                attachment = document;
-                break;
-              }
-            }
-          }
+          final replyText = item['replyToText'] as String?;
+          final replyAttachmentId =
+              item['replyToAttachmentDocumentId'] as String?;
+          final replyTo = replyText == null && replyAttachmentId == null
+              ? null
+              : ChatMessage(
+                  text: replyText ?? '',
+                  isUser: item['replyToIsUser'] as bool? ?? false,
+                  attachment: _documentById(replyAttachmentId),
+                );
           return ChatMessage(
             text: item['text'] as String,
             isUser: item['isUser'] as bool,
-            attachment: attachment,
+            attachment: _documentById(item['attachmentDocumentId'] as String?),
+            replyTo: replyTo,
           );
         }).toList();
       }
@@ -190,6 +195,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _showChatHistory = false;
     _generalMessages.clear();
     _replyingTo = null;
+    _pendingAttachment = null;
   });
 
   void _replyToMessage(ChatMessage message) {
@@ -197,25 +203,45 @@ class _HomeScreenState extends State<HomeScreen> {
     _messageFocusNode.requestFocus();
   }
 
+  ScannedDocument? _documentById(String? id) {
+    if (id == null) return null;
+    for (final document in state.documents) {
+      if (document.id == id) return document;
+    }
+    return null;
+  }
+
   Future<void> _sendMessage() async {
     final question = _messageController.text.trim();
-    if (question.isEmpty || _generalStreaming) return;
+    final attachment = _pendingAttachment;
+    if ((question.isEmpty && attachment == null) || _generalStreaming) return;
+    final replyTarget = _replyingTo;
     final conversationId =
         _activeGeneralChatId ??
         DateTime.now().microsecondsSinceEpoch.toString();
     setState(() {
       _activeGeneralChatId = conversationId;
+      if (attachment != null) _activeDocument = attachment;
       _showDocuments = false;
       _showChatHistory = false;
-      _generalMessages.add(ChatMessage(text: question, isUser: true));
+      _generalMessages.add(
+        ChatMessage(
+          text: question,
+          isUser: true,
+          attachment: attachment,
+          replyTo: replyTarget,
+        ),
+      );
       _messageController.clear();
+      _pendingAttachment = null;
       _replyingTo = null;
       _generalStreaming = true;
     });
     _scrollGeneralToEnd();
     final response = ChatMessage(text: '', isUser: false, streaming: true);
     setState(() => _generalMessages.add(response));
-    for (final token in _generalReply(question).split(' ')) {
+    final prompt = question.isEmpty ? 'Please analyze this image.' : question;
+    for (final token in _generalReply(prompt).split(' ')) {
       await Future<void>.delayed(const Duration(milliseconds: 35));
       if (!mounted) return;
       setState(() => response.text += '$token ');
@@ -258,6 +284,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 'text': message.text,
                 'isUser': message.isUser,
                 'attachmentDocumentId': message.attachment?.id,
+                'replyToText': message.replyTo?.text,
+                'replyToIsUser': message.replyTo?.isUser,
+                'replyToAttachmentDocumentId': message.replyTo?.attachment?.id,
               },
             )
             .toList(),
@@ -298,143 +327,99 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     if (document == null || !mounted) return;
-    await _showDocumentResult(document);
-  }
-
-  Future<void> _showDocumentResult(ScannedDocument document) async {
-    final conversationId =
-        _activeGeneralChatId ??
-        DateTime.now().microsecondsSinceEpoch.toString();
-    setState(() {
-      _activeGeneralChatId = conversationId;
-      _activeDocument = document;
-      _showDocuments = false;
-      _showChatHistory = false;
-      _generalMessages.add(
-        ChatMessage(text: '', isUser: true, attachment: document),
-      );
-      _generalMessages.add(
-        ChatMessage(
-          text:
-              'Here’s the text I extracted from **${document.name}**:\n\n'
-              '```text\n${document.text}\n```',
-          isUser: false,
-        ),
-      );
-    });
-    _scrollGeneralToEnd();
-    await _saveGeneralChat(conversationId);
-    if (_messageController.text.trim().isNotEmpty && mounted) {
-      await _sendMessage();
-    }
+    setState(() => _pendingAttachment = document);
+    _messageFocusNode.requestFocus();
   }
 
   @override
   Widget build(BuildContext context) {
-    final darkTheme = ThemeData.dark(useMaterial3: true).copyWith(
-      scaffoldBackgroundColor: Colors.black,
-      colorScheme: ColorScheme.dark(
-        primary: AppTheme.accent,
-        secondary: AppTheme.accent,
-        surface: Color(0xFF171717),
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      drawer: _ChatHistoryDrawer(
+        state: state,
+        onScan: () {
+          Navigator.pop(context);
+          _scan(context);
+        },
+        onDocuments: () {
+          Navigator.pop(context);
+          setState(() {
+            _showDocuments = true;
+            _showChatHistory = false;
+          });
+        },
+        onChatHistory: () {
+          Navigator.pop(context);
+          setState(() {
+            _showDocuments = false;
+            _showChatHistory = true;
+          });
+        },
+        onNewChat: () {
+          Navigator.pop(context);
+          _startNewGeneralChat();
+        },
+        onResumeGeneralChat: (id) {
+          Navigator.pop(context);
+          _resumeGeneralChat(id);
+        },
+        onDocumentChat: (document) {
+          Navigator.pop(context);
+          _chat(context, document);
+        },
+        onSettings: () {
+          Navigator.pop(context);
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => SettingsScreen(state: state)),
+          );
+        },
       ),
-      dividerColor: const Color(0xFF292929),
-      textSelectionTheme: const TextSelectionThemeData(
-        cursorColor: Colors.white,
-      ),
-      textTheme: ThemeData.dark().textTheme.apply(
-        bodyColor: Colors.white,
-        displayColor: Colors.white,
-        fontFamily: 'KhmerOSSiemReap',
-      ),
-    );
-    return Theme(
-      data: darkTheme,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        drawer: _ChatHistoryDrawer(
-          state: state,
-          onScan: () {
-            Navigator.pop(context);
-            _scan(context);
-          },
-          onDocuments: () {
-            Navigator.pop(context);
-            setState(() {
-              _showDocuments = true;
-              _showChatHistory = false;
-            });
-          },
-          onChatHistory: () {
-            Navigator.pop(context);
-            setState(() {
-              _showDocuments = false;
-              _showChatHistory = true;
-            });
-          },
-          onNewChat: () {
-            Navigator.pop(context);
-            _startNewGeneralChat();
-          },
-          onResumeGeneralChat: (id) {
-            Navigator.pop(context);
-            _resumeGeneralChat(id);
-          },
-          onDocumentChat: (document) {
-            Navigator.pop(context);
-            _chat(context, document);
-          },
-          onSettings: () {
-            Navigator.pop(context);
-            Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => SettingsScreen(state: state)),
-            );
-          },
-        ),
-        body: SafeArea(
-          child: Column(
-            children: [
-              Builder(
-                builder: (scaffoldContext) => _HomeHeader(
-                  onMenu: () => Scaffold.of(scaffoldContext).openDrawer(),
-                  onNewChat: _startNewGeneralChat,
-                ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Builder(
+              builder: (scaffoldContext) => _HomeHeader(
+                onMenu: () => Scaffold.of(scaffoldContext).openDrawer(),
+                onNewChat: _startNewGeneralChat,
               ),
-              Expanded(
-                child: _showChatHistory
-                    ? _ChatHistoryPage(
-                        state: state,
-                        onGeneralChat: _resumeGeneralChat,
-                        onDocumentChat: (document) => _chat(context, document),
-                      )
-                    : _showDocuments
-                    ? state.documents.isEmpty
-                          ? _WelcomePanel(onScan: () => _scan(context))
-                          : _RecentDocuments(
-                              documents: state.documents,
-                              onOpen: (doc) => _detail(context, doc),
-                              onChat: (doc) => _chat(context, doc),
-                            )
-                    : _activeGeneralChatId != null ||
-                          _generalMessages.isNotEmpty
-                    ? _GeneralConversationPanel(
-                        messages: _generalMessages,
-                        controller: _generalScrollController,
-                        onReply: _replyToMessage,
-                      )
-                    : _WelcomePanel(onScan: () => _scan(context)),
+            ),
+            Expanded(
+              child: _showChatHistory
+                  ? _ChatHistoryPage(
+                      state: state,
+                      onGeneralChat: _resumeGeneralChat,
+                      onDocumentChat: (document) => _chat(context, document),
+                    )
+                  : _showDocuments
+                  ? state.documents.isEmpty
+                        ? _WelcomePanel(onScan: () => _scan(context))
+                        : _RecentDocuments(
+                            documents: state.documents,
+                            onOpen: (doc) => _detail(context, doc),
+                            onChat: (doc) => _chat(context, doc),
+                          )
+                  : _activeGeneralChatId != null || _generalMessages.isNotEmpty
+                  ? _GeneralConversationPanel(
+                      messages: _generalMessages,
+                      controller: _generalScrollController,
+                      onReply: _replyToMessage,
+                    )
+                  : _WelcomePanel(onScan: () => _scan(context)),
+            ),
+            if (!_showChatHistory)
+              _HomeComposer(
+                controller: _messageController,
+                focusNode: _messageFocusNode,
+                replyToText: _replyingTo?.text,
+                onCancelReply: () => setState(() => _replyingTo = null),
+                attachment: _pendingAttachment,
+                onRemoveAttachment: () => setState(() {
+                  _pendingAttachment = null;
+                }),
+                onAddAttachment: _showAttachmentMenu,
+                onSend: _sendMessage,
               ),
-              if (!_showChatHistory)
-                _HomeComposer(
-                  controller: _messageController,
-                  focusNode: _messageFocusNode,
-                  replyToText: _replyingTo?.text,
-                  onCancelReply: () => setState(() => _replyingTo = null),
-                  onAddAttachment: _showAttachmentMenu,
-                  onSend: _sendMessage,
-                ),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -483,32 +468,47 @@ class _HeaderCircleButton extends StatelessWidget {
     tooltip: tooltip,
     style: IconButton.styleFrom(
       fixedSize: const Size(54, 54),
-      backgroundColor: const Color(0xFF171717),
-      foregroundColor: Colors.white,
-      side: const BorderSide(color: Color(0xFF2A2A2A)),
+      backgroundColor: Theme.of(context).brightness == Brightness.dark
+          ? const Color(0xFF171717)
+          : const Color(0xFFF1F1F3),
+      foregroundColor: Theme.of(context).colorScheme.onSurface,
+      side: BorderSide(
+        color: Theme.of(context).brightness == Brightness.dark
+            ? const Color(0xFF2A2A2A)
+            : const Color(0xFFE1E1E5),
+      ),
     ),
     icon: icon,
   );
 }
 
 class _ComposeGlyph extends StatelessWidget {
-  const _ComposeGlyph({required this.size});
+  const _ComposeGlyph({required this.size, this.color});
 
   final double size;
+  final Color? color;
 
   @override
-  Widget build(BuildContext context) =>
-      CustomPaint(size: Size.square(size), painter: _ComposeGlyphPainter());
+  Widget build(BuildContext context) => CustomPaint(
+    size: Size.square(size),
+    painter: _ComposeGlyphPainter(
+      color ?? Theme.of(context).colorScheme.onSurface,
+    ),
+  );
 }
 
 class _ComposeGlyphPainter extends CustomPainter {
+  const _ComposeGlyphPainter(this.color);
+
+  final Color color;
+
   @override
   void paint(Canvas canvas, Size size) {
     final scale = size.width / 24;
     canvas.save();
     canvas.scale(scale);
     final paint = Paint()
-      ..color = Colors.white
+      ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.1
       ..strokeCap = StrokeCap.round
@@ -540,7 +540,8 @@ class _ComposeGlyphPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _ComposeGlyphPainter oldDelegate) =>
+      color != oldDelegate.color;
 }
 
 class _RecentDocuments extends StatelessWidget {
@@ -613,6 +614,8 @@ class _HomeComposer extends StatelessWidget {
     required this.focusNode,
     required this.replyToText,
     required this.onCancelReply,
+    required this.attachment,
+    required this.onRemoveAttachment,
     required this.onAddAttachment,
     required this.onSend,
   });
@@ -621,11 +624,14 @@ class _HomeComposer extends StatelessWidget {
   final FocusNode focusNode;
   final String? replyToText;
   final VoidCallback onCancelReply;
+  final ScannedDocument? attachment;
+  final VoidCallback onRemoveAttachment;
   final VoidCallback onAddAttachment;
   final VoidCallback onSend;
 
   @override
   Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
     return SafeArea(
       top: false,
       child: Center(
@@ -644,85 +650,115 @@ class _HomeComposer extends StatelessWidget {
                 Container(
                   padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF111111),
-                    border: Border.all(color: const Color(0xFF292929)),
+                    color: dark
+                        ? const Color(0xFF111111)
+                        : const Color(0xFFF5F5F7),
+                    border: Border.all(
+                      color: dark
+                          ? const Color(0xFF292929)
+                          : const Color(0xFFE1E1E5),
+                    ),
                     borderRadius: BorderRadius.circular(34),
                   ),
-                  child: Row(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      SizedBox.square(
-                        dimension: 44,
-                        child: Material(
-                          color: const Color(0xFF242424),
-                          shape: const CircleBorder(),
-                          clipBehavior: Clip.antiAlias,
-                          child: InkWell(
-                            onTap: onAddAttachment,
-                            customBorder: const CircleBorder(),
-                            child: const Center(
-                              child: Icon(
-                                Icons.add_rounded,
-                                color: Colors.white,
-                                size: 28,
-                              ),
+                      if (attachment != null)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
+                            child: _AttachmentPreview(
+                              document: attachment!,
+                              onRemove: onRemoveAttachment,
                             ),
                           ),
                         ),
-                      ),
-                      Expanded(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            TextField(
+                      Row(
+                        children: [
+                          SizedBox.square(
+                            dimension: 44,
+                            child: Material(
+                              color: dark
+                                  ? const Color(0xFF242424)
+                                  : const Color(0xFFE9E9EC),
+                              shape: const CircleBorder(),
+                              clipBehavior: Clip.antiAlias,
+                              child: InkWell(
+                                onTap: onAddAttachment,
+                                customBorder: const CircleBorder(),
+                                child: Center(
+                                  child: Icon(
+                                    Icons.add_rounded,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurface,
+                                    size: 28,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          Expanded(
+                            child: TextField(
                               controller: controller,
                               focusNode: focusNode,
-                              cursorColor: Colors.white,
+                              cursorColor: Theme.of(
+                                context,
+                              ).colorScheme.primary,
                               minLines: 1,
                               maxLines: 4,
                               textCapitalization: TextCapitalization.sentences,
                               onSubmitted: (_) => onSend(),
-                              style: const TextStyle(
-                                color: Colors.white,
+                              style: TextStyle(
+                                color: Theme.of(context).colorScheme.onSurface,
                                 fontSize: 17,
                               ),
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 hintText: 'Ask anything',
-                                hintStyle: TextStyle(color: Color(0xFF858585)),
+                                hintStyle: TextStyle(
+                                  color: Theme.of(context).hintColor,
+                                ),
                                 border: InputBorder.none,
-                                contentPadding: EdgeInsets.symmetric(
+                                contentPadding: const EdgeInsets.symmetric(
                                   horizontal: 8,
                                   vertical: 10,
                                 ),
                                 isDense: true,
                               ),
                             ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      ValueListenableBuilder<TextEditingValue>(
-                        valueListenable: controller,
-                        builder: (context, value, _) {
-                          final active = value.text.trim().isNotEmpty;
-                          return IconButton(
-                            onPressed: active ? onSend : null,
-                            tooltip: 'Send message',
-                            style: IconButton.styleFrom(
-                              fixedSize: const Size(48, 48),
-                              backgroundColor: active
-                                  ? AppTheme.accent
-                                  : const Color(0xFF252525),
-                              foregroundColor: active
-                                  ? Colors.white
-                                  : const Color(0xFF888888),
-                            ),
-                            icon: const Icon(
-                              Icons.arrow_upward_rounded,
-                              size: 25,
-                            ),
-                          );
-                        },
+                          ),
+                          const SizedBox(width: 4),
+                          ValueListenableBuilder<TextEditingValue>(
+                            valueListenable: controller,
+                            builder: (context, value, _) {
+                              final active =
+                                  value.text.trim().isNotEmpty ||
+                                  attachment != null;
+                              return IconButton(
+                                onPressed: active ? onSend : null,
+                                tooltip: 'Send message',
+                                style: IconButton.styleFrom(
+                                  fixedSize: const Size(48, 48),
+                                  backgroundColor: active
+                                      ? AppTheme.accent
+                                      : dark
+                                      ? const Color(0xFF252525)
+                                      : const Color(0xFFE6E6E8),
+                                  foregroundColor: active
+                                      ? Colors.white
+                                      : dark
+                                      ? const Color(0xFF888888)
+                                      : const Color(0xFF77777D),
+                                ),
+                                icon: const Icon(
+                                  Icons.arrow_upward_rounded,
+                                  size: 25,
+                                ),
+                              );
+                            },
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -736,6 +772,62 @@ class _HomeComposer extends StatelessWidget {
   }
 }
 
+class _AttachmentPreview extends StatelessWidget {
+  const _AttachmentPreview({required this.document, required this.onRemove});
+
+  final ScannedDocument document;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 132,
+    height: 132,
+    child: Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned.fill(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: document.imageBytes != null
+                ? Image.memory(document.imageBytes!, fit: BoxFit.cover)
+                : Container(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.surfaceContainerHighest,
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.all(10),
+                    child: Text(
+                      document.name,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+          ),
+        ),
+        Positioned(
+          top: 7,
+          right: 7,
+          child: Material(
+            color: Colors.black54,
+            shape: const CircleBorder(),
+            child: InkWell(
+              onTap: onRemove,
+              customBorder: const CircleBorder(),
+              child: const SizedBox(
+                width: 30,
+                height: 30,
+                child: Icon(Icons.close_rounded, color: Colors.white, size: 20),
+              ),
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 class _AttachmentMenu extends StatelessWidget {
   const _AttachmentMenu({required this.onCamera, required this.onUpload});
 
@@ -746,8 +838,10 @@ class _AttachmentMenu extends StatelessWidget {
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
     decoration: BoxDecoration(
-      color: const Color(0xFF141414),
-      border: Border.all(color: const Color(0xFF303030)),
+      color: Theme.of(context).brightness == Brightness.dark
+          ? const Color(0xFF141414)
+          : const Color(0xFFF1F1F3),
+      border: Border.all(color: Theme.of(context).dividerColor),
       borderRadius: BorderRadius.circular(30),
     ),
     child: Column(
@@ -790,17 +884,23 @@ class _AttachmentMenuItem extends StatelessWidget {
           Container(
             width: 48,
             height: 48,
-            decoration: const BoxDecoration(
-              color: Color(0xFF242424),
+            decoration: BoxDecoration(
+              color: Theme.of(context).brightness == Brightness.dark
+                  ? const Color(0xFF242424)
+                  : const Color(0xFFE6E6E8),
               shape: BoxShape.circle,
             ),
-            child: Icon(icon, color: Colors.white, size: 25),
+            child: Icon(
+              icon,
+              color: Theme.of(context).colorScheme.onSurface,
+              size: 25,
+            ),
           ),
           const SizedBox(width: 18),
           Text(
             label,
-            style: const TextStyle(
-              color: Colors.white,
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurface,
               fontSize: 18,
               fontWeight: FontWeight.w400,
             ),
@@ -835,7 +935,7 @@ class _ChatHistoryDrawer extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Drawer(
     width: MediaQuery.sizeOf(context).width * .8,
-    backgroundColor: Colors.black,
+    backgroundColor: Theme.of(context).scaffoldBackgroundColor,
     surfaceTintColor: Colors.transparent,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.horizontal(right: Radius.circular(28)),
@@ -847,11 +947,11 @@ class _ChatHistoryDrawer extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(24, 26, 18, 22),
             child: Row(
               children: [
-                const Expanded(
+                Expanded(
                   child: Text(
                     'Jakhok',
                     style: TextStyle(
-                      color: Colors.white,
+                      color: Theme.of(context).colorScheme.onSurface,
                       fontSize: 26,
                       fontWeight: FontWeight.w600,
                     ),
@@ -861,7 +961,9 @@ class _ChatHistoryDrawer extends StatelessWidget {
                   onPressed: onChatHistory,
                   tooltip: 'Search chat history',
                   icon: const Icon(Icons.search_rounded, size: 29),
-                  style: IconButton.styleFrom(foregroundColor: Colors.white),
+                  style: IconButton.styleFrom(
+                    foregroundColor: Theme.of(context).colorScheme.onSurface,
+                  ),
                 ),
               ],
             ),
@@ -913,24 +1015,27 @@ class _ChatHistoryDrawer extends StatelessWidget {
                 return ListView(
                   padding: const EdgeInsets.fromLTRB(24, 12, 18, 12),
                   children: [
-                    const Divider(color: Color(0xFF303030), height: 1),
-                    const Padding(
+                    Divider(color: Theme.of(context).dividerColor, height: 1),
+                    Padding(
                       padding: EdgeInsets.only(top: 14, bottom: 4),
                       child: Text(
                         'Recent chats',
                         style: TextStyle(
-                          color: Colors.white70,
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                           fontSize: 13,
                           fontWeight: FontWeight.w500,
                         ),
                       ),
                     ),
                     if (visibleRecents.isEmpty)
-                      const Padding(
+                      Padding(
                         padding: EdgeInsets.symmetric(vertical: 8),
                         child: Text(
                           'Your recent chats will appear here.',
-                          style: TextStyle(color: Colors.white54, fontSize: 14),
+                          style: TextStyle(
+                            color: Theme.of(context).hintColor,
+                            fontSize: 14,
+                          ),
                         ),
                       )
                     else
@@ -947,8 +1052,10 @@ class _ChatHistoryDrawer extends StatelessWidget {
                                     recent.title,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: Colors.white,
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurface,
                                       fontSize: 14,
                                       fontWeight: FontWeight.w400,
                                     ),
@@ -958,8 +1065,8 @@ class _ChatHistoryDrawer extends StatelessWidget {
                                 Text(
                                   '${recent.updatedAt.day.toString().padLeft(2, '0')}/'
                                   '${recent.updatedAt.month.toString().padLeft(2, '0')}',
-                                  style: const TextStyle(
-                                    color: Colors.white54,
+                                  style: TextStyle(
+                                    color: Theme.of(context).hintColor,
                                     fontSize: 12,
                                   ),
                                 ),
@@ -974,7 +1081,9 @@ class _ChatHistoryDrawer extends StatelessWidget {
                         style: TextButton.styleFrom(
                           alignment: Alignment.centerLeft,
                           padding: const EdgeInsets.symmetric(vertical: 8),
-                          foregroundColor: Colors.white60,
+                          foregroundColor: Theme.of(
+                            context,
+                          ).colorScheme.onSurface,
                         ),
                         child: const Text('See all…'),
                       ),
@@ -996,7 +1105,7 @@ class _ChatHistoryDrawer extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(vertical: 16),
                       shape: const StadiumBorder(),
                     ),
-                    icon: const _ComposeGlyph(size: 24),
+                    icon: const _ComposeGlyph(size: 24, color: Colors.white),
                     label: const Text(
                       'Chat',
                       style: TextStyle(
@@ -1011,17 +1120,19 @@ class _ChatHistoryDrawer extends StatelessWidget {
                   width: 52,
                   height: 52,
                   alignment: Alignment.center,
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: Color(0xFF242424),
+                    color: Theme.of(context).brightness == Brightness.dark
+                        ? const Color(0xFF242424)
+                        : const Color(0xFFE6E6E8),
                     border: Border.fromBorderSide(
-                      BorderSide(color: Color(0xFF383838)),
+                      BorderSide(color: Theme.of(context).dividerColor),
                     ),
                   ),
-                  child: const Text(
+                  child: Text(
                     'KO',
                     style: TextStyle(
-                      color: Colors.white,
+                      color: Theme.of(context).colorScheme.onSurface,
                       fontSize: 15,
                       fontWeight: FontWeight.w600,
                     ),
@@ -1091,19 +1202,21 @@ class _ChatHistoryPageState extends State<_ChatHistoryPage> {
           child: TextField(
             controller: _searchController,
             onChanged: (_) => setState(() {}),
-            style: const TextStyle(color: Colors.white),
+            style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
             decoration: InputDecoration(
               hintText: 'Search chat history',
               prefixIcon: const Icon(Icons.search_rounded),
               filled: true,
-              fillColor: const Color(0xFF171717),
+              fillColor: Theme.of(context).brightness == Brightness.dark
+                  ? const Color(0xFF171717)
+                  : const Color(0xFFF1F1F3),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(24),
-                borderSide: const BorderSide(color: Color(0xFF303030)),
+                borderSide: BorderSide(color: Theme.of(context).dividerColor),
               ),
               enabledBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(24),
-                borderSide: const BorderSide(color: Color(0xFF303030)),
+                borderSide: BorderSide(color: Theme.of(context).dividerColor),
               ),
               contentPadding: const EdgeInsets.symmetric(vertical: 10),
             ),
@@ -1123,7 +1236,7 @@ class _ChatHistoryPageState extends State<_ChatHistoryPage> {
                     query.isEmpty
                         ? 'Your chats will appear here.'
                         : 'No matching chats found.',
-                    style: const TextStyle(color: Color(0xFF888888)),
+                    style: TextStyle(color: Theme.of(context).hintColor),
                   ),
                 )
               : ListView(
@@ -1207,11 +1320,26 @@ class _SidebarAction extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 24),
         child: Row(
           children: [
-            customIcon ?? Icon(icon, size: 27, color: Colors.white),
+            customIcon == null
+                ? Icon(
+                    icon,
+                    size: 27,
+                    color: Theme.of(context).colorScheme.onSurface,
+                  )
+                : ColorFiltered(
+                    colorFilter: ColorFilter.mode(
+                      Theme.of(context).colorScheme.onSurface,
+                      BlendMode.srcIn,
+                    ),
+                    child: customIcon,
+                  ),
             const SizedBox(width: 18),
             Text(
               title,
-              style: const TextStyle(color: Colors.white, fontSize: 17),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurface,
+                fontSize: 17,
+              ),
             ),
           ],
         ),
@@ -1384,13 +1512,15 @@ class _WelcomePanel extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 12),
-        const Padding(
+        Padding(
           padding: EdgeInsets.symmetric(horizontal: 32),
           child: Text(
             'Extract text, explore your files, and get answers from your documents.',
             textAlign: TextAlign.center,
             style: TextStyle(
-              color: Color(0xFFAAAAAA),
+              color: Theme.of(context).brightness == Brightness.dark
+                  ? Color(0xFFAAAAAA)
+                  : Color(0xFF66666D),
               fontSize: 17,
               height: 1.55,
             ),
@@ -1400,9 +1530,11 @@ class _WelcomePanel extends StatelessWidget {
         FilledButton(
           onPressed: onScan,
           style: FilledButton.styleFrom(
-            backgroundColor: const Color(0xFF202020),
-            foregroundColor: Colors.white,
-            side: const BorderSide(color: Color(0xFF303030)),
+            backgroundColor: Theme.of(context).brightness == Brightness.dark
+                ? const Color(0xFF202020)
+                : const Color(0xFFF1F1F3),
+            foregroundColor: Theme.of(context).colorScheme.onSurface,
+            side: BorderSide(color: Theme.of(context).dividerColor),
             padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 10),
             minimumSize: const Size(0, 42),
           ),

@@ -49,6 +49,14 @@ class _ChatScreenState extends State<ChatScreen> {
   String get _conversationId => widget.document?.id ?? widget.conversationId!;
   String get _historyKey => AppState.chatHistoryKey(_conversationId);
 
+  ScannedDocument? _documentById(String? id) {
+    if (id == null) return null;
+    for (final document in widget.state.documents) {
+      if (document.id == id) return document;
+    }
+    return null;
+  }
+
   Future<void> _loadHistory() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -60,9 +68,23 @@ class _ChatScreenState extends State<ChatScreen> {
           ..addAll(
             rows.map((row) {
               final item = row as Map<String, dynamic>;
+              final replyText = item['replyToText'] as String?;
+              final replyAttachmentId =
+                  item['replyToAttachmentDocumentId'] as String?;
+              final replyTo = replyText == null && replyAttachmentId == null
+                  ? null
+                  : ChatMessage(
+                      text: replyText ?? '',
+                      isUser: item['replyToIsUser'] as bool? ?? false,
+                      attachment: _documentById(replyAttachmentId),
+                    );
               return ChatMessage(
                 text: item['text'] as String,
                 isUser: item['isUser'] as bool,
+                attachment: _documentById(
+                  item['attachmentDocumentId'] as String?,
+                ),
+                replyTo: replyTo,
               );
             }),
           );
@@ -111,7 +133,16 @@ class _ChatScreenState extends State<ChatScreen> {
       _historyKey,
       jsonEncode(
         _messages
-            .map((message) => {'text': message.text, 'isUser': message.isUser})
+            .map(
+              (message) => {
+                'text': message.text,
+                'isUser': message.isUser,
+                'attachmentDocumentId': message.attachment?.id,
+                'replyToText': message.replyTo?.text,
+                'replyToIsUser': message.replyTo?.isUser,
+                'replyToAttachmentDocumentId': message.replyTo?.attachment?.id,
+              },
+            )
             .toList(),
       ),
     );
@@ -144,8 +175,11 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _send([String? preset]) async {
     final question = (preset ?? _controller.text).trim();
     if (question.isEmpty || _streaming) return;
+    final replyTarget = _replyingTo;
     setState(() {
-      _messages.add(ChatMessage(text: question, isUser: true));
+      _messages.add(
+        ChatMessage(text: question, isUser: true, replyTo: replyTarget),
+      );
       _controller.clear();
       _replyingTo = null;
       _streaming = true;

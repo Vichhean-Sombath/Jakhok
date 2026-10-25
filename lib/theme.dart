@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 class AppTheme {
   // Change this single token to update active chips and selection accents.
-  static Color accent = const Color(0xFF3563F5);
+  static const Color accent = Color(0xFF3563F5);
   static const lightBg = Color(0xFFFFFFFF);
   static const darkBg = Color(0xFF1A1A1A);
   static const primary = Color(0xFF1F1F1F);
@@ -42,12 +42,8 @@ class AppTheme {
       ),
       dividerColor: dark ? const Color(0xFF333333) : border,
       iconTheme: IconThemeData(color: fg),
-      textSelectionTheme: const TextSelectionThemeData(
-        cursorColor: Colors.white,
-      ),
-      textTheme: ThemeData(
-        brightness: brightness,
-      ).textTheme.apply(
+      textSelectionTheme: TextSelectionThemeData(cursorColor: fg),
+      textTheme: ThemeData(brightness: brightness).textTheme.apply(
         bodyColor: fg,
         displayColor: fg,
         fontFamily: 'KhmerOSSiemReap',

@@ -21,7 +21,7 @@ The camera and photo library usage descriptions, Android camera permission, and 
 
 - Scanning, gallery selection, OCR, local document saving, document detail, and chat navigation work without a backend.
 - The chat streams a local mock answer. Replace `_mockAnswer` in `lib/screens/chat_screen.dart` with the future API integration.
-- OCR is configured for Latin script via Google ML Kit. Khmer OCR requires a Khmer-capable on-device recognition model; the project does not include trained Khmer model data yet.
+- Web image OCR uses Tesseract with Khmer and English language data. Android and iOS image OCR currently use Google ML Kit's Latin recognizer; the project does not yet include a Khmer-capable mobile OCR model.
 
 ## Styling
 

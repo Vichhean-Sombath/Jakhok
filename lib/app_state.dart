@@ -4,13 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models/document.dart';
-import 'theme.dart';
 
 class AppState extends ChangeNotifier {
   static const _docsKey = 'scanned_documents_v1';
   static const _generalChatsKey = 'general_chat_sessions_v1';
   static const _darkKey = 'dark_mode_v1';
-  static const _accentKey = 'accent_color_v1';
   static String chatHistoryKey(String documentId) => 'chat_history_$documentId';
   final List<ScannedDocument> documents = [];
   final List<GeneralChatSession> generalChatHistory = [];
@@ -24,9 +22,6 @@ class AppState extends ChangeNotifier {
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     isDark = prefs.getBool(_darkKey) ?? false;
-    AppTheme.accent = Color(
-      prefs.getInt(_accentKey) ?? const Color(0xFF3563F5).value,
-    );
     final raw = prefs.getString(_docsKey);
     if (raw != null) {
       try {
@@ -120,13 +115,6 @@ class AppState extends ChangeNotifier {
     isDark = value;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_darkKey, isDark);
-    notifyListeners();
-  }
-
-  Future<void> setAccentColor(Color value) async {
-    AppTheme.accent = value;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_accentKey, value.value);
     notifyListeners();
   }
 
