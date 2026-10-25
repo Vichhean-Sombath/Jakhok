@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="km" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KhmerOCR — បំប្លែងរូបភាពទៅជាអក្សរខ្មែរ (OpenKhmer PaddleOCR-VL)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Kantumruy+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Noto+Sans+Khmer:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="stylesheet" href="/static/styles.css?v=ocr-ui-7" />
+  <script>
+    window.MathJax = {
+      loader: { load: ["ui/safe"] },
+      tex: {
+        // Keep only unambiguous math delimiters; single-dollar text may be currency.
+        inlineMath: [["\\(", "\\)"]],
+        displayMath: [["\\[", "\\]"], ["$$", "$$"]]
+      },
+      output: {
+        displayOverflow: "linebreak",
+        linebreaks: { inline: true, width: "100%" }
+      },
+      startup: { typeset: false }
+    };
+  </script>
+  <script id="mathJaxScript" defer src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-mml-chtml.js"></script>
+</head>
+<body>
+  <!-- Top Navigation Header (KhmerScan Style) -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">ក</div>
+        <div>
+          <div class="brand-title-row">
+            <h1>KhmerOCR</h1>
+            <span class="badge-lora">AI Vision + Layout</span>
+          </div>
+          <p class="brand-subtitle">បំប្លែងរូបភាពទៅជាអក្សរខ្មែរ • OpenKhmer PaddleOCR-VL</p>
+        </div>
+      </div>
+
+      <div class="status-cluster">
+        <div id="statusPill" class="status-pill status-loading" title="Model status">
+          <span class="status-dot"></span>
+          <span id="statusText">Connecting to backend...</span>
+        </div>
+        <div id="deviceBadge" class="device-badge" hidden></div>
+        <button type="button" id="themeToggleBtn" class="btn-icon theme-toggle-btn" aria-label="Toggle light and dark theme" title="Toggle Light / Dark theme">
+          🌙
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="main-container">
+    <!-- Hero AI Banner Pill -->
+    <div class="ai-banner">
+      <div class="ai-banner-left">
+        <span class="ai-sparkle">✨</span>
+        <span>បំប្លែងរូបភាពដោយ AI (OpenKhmer Vision+Language LoRA)</span>
+      </div>
+      <div class="ai-banner-right">
+        <span id="detCountBadge" class="det-count-badge">0 regions detected</span>
+        <span class="ai-pill-tag">មិនគិតថ្លៃ • Local GPU</span>
+      </div>
+    </div>
+
+    <!-- Section Header -->
+    <div class="hero-heading-row">
+      <div>
+        <h2 class="kh-hero-title">បំប្លែងរូបភាពទៅជាអក្សរខ្មែរ</h2>
+        <p class="kh-hero-sub">
+          ឯកសារអាចបញ្ចូលក្នុងទម្រង់៖ PNG, JPG, WEBP, BMP (ទំហំអតិបរមា 20MB) • ចុច <kbd>Ctrl</kbd>+<kbd>V</kbd> ដើម្បីបិទភ្ជាប់រូបភាព
+        </p>
+      </div>
+      <div class="quick-actions">
+        <button type="button" id="pasteBtn" class="btn btn-secondary btn-sm" title="Paste image from clipboard">
+          📋 បិទភ្ជាប់ (Paste)
+        </button>
+        <button type="button" id="sampleBtn" class="btn btn-secondary btn-sm" title="Generate a sample Khmer image to test OCR">
+          🇰🇭 រូបភាពគំរូ (Sample)
+        </button>
+      </div>
+    </div>
+
+    <!-- Upload & Live Detection Card -->
+    <section class="card upload-section-card">
+      <div id="dropzone" class="dropzone">
+        <input type="file" id="fileInput" accept="image/*" hidden />
+
+        <!-- Empty State (Dashed Upload Bar like KhmerScan) -->
+        <div id="emptyState" class="dropzone-empty" tabindex="0" role="button" aria-label="Choose an image or drop one here">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <span class="drop-title">សូមចុចទីនេះ ឬទម្លាក់ឯកសាររូបភាពនៅទីនេះ (Click or drop image here)</span>
+        </div>
+
+        <!-- Image Preview + Interactive Detection Overlay -->
+        <div id="previewContainer" class="preview-container" hidden>
+          <div class="detection-legend-bar">
+            <div class="legend-items">
+              <span class="legend-dot legend-pending"></span><span class="legend-label">Detected</span>
+              <span class="legend-dot legend-active"></span><span class="legend-label">Recognizing</span>
+              <span class="legend-dot legend-done"></span><span class="legend-label">Completed</span>
+            </div>
+            <div class="legend-actions">
+              <label class="toggle-mini">
+                <input type="checkbox" id="showBoxesToggle" checked />
+                <span>Show Boxes</span>
+              </label>
+              <label class="toggle-mini">
+                <input type="checkbox" id="showNumbersToggle" checked />
+                <span>#IDs</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="preview-canvas-wrap" id="canvasStage">
+            <div class="image-overlay-stage" id="overlayStage">
+              <img id="imagePreview" alt="Uploaded OCR preview" />
+              <canvas id="detectionCanvas"></canvas>
+              <div id="canvasTooltip" class="canvas-tooltip" hidden></div>
+            </div>
+          </div>
+
+          <div class="preview-toolbar">
+            <span id="imageMeta" class="image-meta">—</span>
+            <div class="preview-tools">
+              <button type="button" id="redetectBtn" class="btn btn-secondary btn-xs" title="Re-run text box detection">
+                🎯 Detect Boxes
+              </button>
+              <button type="button" id="rotateLeftBtn" class="btn-icon" title="Rotate 90° Counter-Clockwise">↺</button>
+              <button type="button" id="rotateRightBtn" class="btn-icon" title="Rotate 90° Clockwise">↻</button>
+              <button type="button" id="changeImageBtn" class="btn btn-ghost btn-xs">ប្តូររូបភាព (Change)</button>
+              <button type="button" id="clearImageBtn" class="btn btn-danger-ghost btn-xs">លុប (Remove)</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Compact Controls & Primary Action Bar -->
+      <div class="controls-bar">
+        <div class="controls-grid-3">
+          <div class="field">
+            <label for="detModeSelect">Text Detection Engine</label>
+            <select id="detModeSelect" class="select-input">
+              <option value="smart_hybrid" selected>Smart Hybrid (Auto DBNet Lines + PP-DocLayoutV2)</option>
+              <option value="standard">PP-OCRv4 DBNet (Line-by-Line for Poems, Tables &amp; Docs)</option>
+              <option value="dense">PP-OCRv4 DBNet Dense (Small Text &amp; Org Charts)</option>
+              <option value="pp_doclayout_v2">PP-DocLayoutV2 Only (Document Blocks &amp; Equations)</option>
+              <option value="none">Full Image Only (No Box Split)</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="taskSelect">Recognition Task</label>
+            <select id="taskSelect" class="select-input">
+              <option value="ocr" selected>OCR — Text Recognition (OCR:)</option>
+              <option value="table">Table Recognition</option>
+              <option value="formula">Formula Recognition</option>
+              <option value="chart">Chart Recognition</option>
+              <option value="custom">Custom Prompt...</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="maxTokensInput">Max Tokens: <span id="maxTokensVal">1024</span></label>
+            <input type="range" id="maxTokensInput" min="128" max="2048" step="128" value="1024" class="range-input" />
+          </div>
+        </div>
+
+        <div id="customPromptWrap" class="field" hidden>
+          <label for="customPromptInput">Custom Prompt</label>
+          <input type="text" id="customPromptInput" class="text-input" placeholder="e.g., OCR:" value="OCR:" />
+        </div>
+
+        <div class="controls-bottom-row">
+          <div class="toggles-row">
+            <label class="toggle-item">
+              <input type="checkbox" id="useLoraToggle" checked />
+              <span>Use Fine-Tuned LoRA</span>
+            </label>
+            <label class="toggle-item">
+              <input type="checkbox" id="streamToggle" checked />
+              <span>Live Streaming</span>
+            </label>
+          </div>
+
+          <div class="action-buttons">
+            <button type="button" id="runOcrBtn" class="btn btn-primary btn-lg" disabled>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <span id="runOcrBtnText">បំប្លែងអក្សរ (Extract Text)</span>
+            </button>
+            <button type="button" id="compareBtn" class="btn btn-secondary btn-lg" disabled>
+              Compare LoRA vs Base
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Progress Banner -->
+      <div id="liveProgressBarWrap" class="live-progress-wrap" hidden>
+        <div class="live-progress-info">
+          <span id="liveProgressText">Recognizing region #1...</span>
+          <span id="liveProgressPct">0%</span>
+        </div>
+        <div class="live-progress-track">
+          <div id="liveProgressFill" class="live-progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <!-- Metrics Bar -->
+      <div id="metricsBar" class="metrics-bar" hidden>
+        <span id="metricModel" class="metric-chip metric-model">LoRA Active</span>
+        <span id="metricRegions" class="metric-chip">0 regions</span>
+        <span id="metricTime" class="metric-chip">0.0s</span>
+        <span id="metricSpeed" class="metric-chip">0 tok/s</span>
+        <span id="metricChars" class="metric-chip">0 chars</span>
+      </div>
+    </section>
+
+    <!-- CARD 1: លទ្ធផល (Plain Text Output — KhmerScan Top Card) -->
+    <section class="card result-section-card">
+      <div class="section-bar">
+        <div class="section-title-group">
+          <span class="section-icon-green">📄</span>
+          <h3 class="section-kh-title">លទ្ធផល <span class="section-en-sub">(Plain Text)</span></h3>
+          <div class="view-tabs" role="tablist">
+            <button type="button" id="tabCombinedBtn" class="view-tab active" role="tab">អត្ថបទរួម (Text)</button>
+            <button type="button" id="tabRegionsBtn" class="view-tab" role="tab">
+              តាមប្រអប់នីមួយៗ (Regions) <span id="regionTabCount" class="tab-badge">0</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="section-actions">
+          <div class="font-size-group" title="Adjust Khmer text display size">
+            <button type="button" id="fontDecBtn" class="btn-action-pill" aria-label="Decrease font size">A−</button>
+            <button type="button" id="fontIncBtn" class="btn-action-pill" aria-label="Increase font size">A+</button>
+          </div>
+          <button type="button" id="copyBtn" class="btn-action-pill" disabled>
+            📋 <span id="copyBtnText">ចម្លង</span>
+          </button>
+          <button type="button" id="downloadTxtBtn" class="btn-action-pill" disabled>
+            ⬇️ ទាញយក TXT
+          </button>
+          <button type="button" id="downloadDocxPlainBtn" class="btn-action-pill btn-docx" disabled>
+            ⬇️ DOCX
+          </button>
+          <button type="button" id="downloadMdBtn" class="btn-action-pill" disabled>.MD</button>
+          <button type="button" id="downloadJsonBtn" class="btn-action-pill" disabled>.JSON</button>
+        </div>
+      </div>
+
+      <!-- Tab 1: Plain Textarea -->
+      <div id="singleOutputWrap" class="output-editor-wrap">
+        <textarea
+          id="ocrOutput"
+          class="ocr-textarea"
+          placeholder="លទ្ធផលអក្សរខ្មែរនឹងបង្ហាញនៅទីនេះ...&#10;Recognized Khmer &amp; multilingual text will appear here live as each detected box is processed."
+          spellcheck="false"
+        ></textarea>
+      </div>
+
+      <!-- Tab 2: Region-by-Region Inspector -->
+      <div id="regionsInspectorWrap" class="regions-inspector-wrap" hidden>
+        <div id="regionsList" class="regions-list">
+          <p class="history-empty">Run OCR to inspect each detected text box crop alongside its recognized Khmer text.</p>
+        </div>
+      </div>
+
+      <!-- Side-by-Side Comparison View -->
+      <div id="compareOutputWrap" class="compare-grid" hidden>
+        <div class="compare-card compare-lora">
+          <div class="compare-card-header">
+            <span class="badge-lora">Fine-Tuned LoRA</span>
+            <span id="compareLoraTime" class="compare-meta">—</span>
+          </div>
+          <textarea id="compareLoraText" class="ocr-textarea compare-textarea" readonly></textarea>
+        </div>
+        <div class="compare-card compare-base">
+          <div class="compare-card-header">
+            <span class="badge-base">Base PaddleOCR-VL</span>
+            <span id="compareBaseTime" class="compare-meta">—</span>
+          </div>
+          <textarea id="compareBaseText" class="ocr-textarea compare-textarea" readonly></textarea>
+        </div>
+      </div>
+    </section>
+
+    <!-- CARD 2: ការរៀបចំទំព័រ / ទម្រង់ដូចទំព័រដើម (2D Spatial Page Reconstruction — KhmerScan Bottom Card!) -->
+    <section class="card layout-section-card">
+      <div class="section-bar">
+        <div class="section-title-group">
+          <span class="section-icon-green">📐</span>
+          <h3 class="section-kh-title">ការរៀបចំទំព័រ <span class="section-en-sub">(2D Page Layout View — Editable)</span></h3>
+        </div>
+
+        <div class="section-actions">
+          <button type="button" id="copyLayoutBtn" class="btn-action-pill" disabled>
+            📋 <span id="copyLayoutBtnText">ចម្លង</span>
+          </button>
+          <button type="button" id="downloadLayoutTxtBtn" class="btn-action-pill" disabled>
+            ⬇️ TXT
+          </button>
+          <button type="button" id="downloadDocxLayoutBtn" class="btn-action-pill btn-docx" disabled>
+            ⬇️ DOCX
+          </button>
+        </div>
+      </div>
+
+      <div class="page-layout-outer-stage">
+        <div id="pageLayoutCanvas" class="page-layout-sheet">
+          <div class="page-layout-empty">
+            ទម្រង់រៀបចំទំព័រដូចរូបភាពដើមនឹងបង្ហាញនៅទីនេះដោយស្វ័យប្រវត្តិ...<br/>
+            <span>Exact 2D spatial page layout (titles, columns, stanzas, tables) will reconstruct here live as regions are recognized.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Recent Scans History Card -->
+    <section class="card history-section">
+      <div class="history-header">
+        <h3>ប្រវត្តិស្កេនថ្មីៗ (Recent Scans) <span id="historyCount" class="history-count">0</span></h3>
+        <button type="button" id="clearHistoryBtn" class="btn btn-ghost btn-xs" hidden>Clear History</button>
+      </div>
+      <div id="historyList" class="history-list">
+        <p class="history-empty">Your OCR results in this session will be saved here for quick access.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js?v=ocr-ui-4"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+checkpoints/
+merged_model/
+*.log
+Khmer-OCR-App-Share.zip
