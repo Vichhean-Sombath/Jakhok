@@ -1614,11 +1614,10 @@ kbd {
     margin: 10px auto;
     display: grid;
     grid-template-columns: minmax(320px, 0.92fr) minmax(360px, 1fr) minmax(500px, 1.38fr);
-    grid-template-rows: auto minmax(0, 1fr) clamp(96px, 12vh, 116px);
+    grid-template-rows: auto minmax(0, 1fr);
     grid-template-areas:
       "banner hero hero"
-      "upload result layout"
-      "history history history";
+      "upload result layout";
     align-items: stretch;
     gap: 10px;
     overflow: hidden;
@@ -1629,7 +1628,6 @@ kbd {
   .main-container > .upload-section-card { grid-area: upload; }
   .main-container > .result-section-card { grid-area: result; }
   .main-container > .layout-section-card { grid-area: layout; }
-  .main-container > .history-section { grid-area: history; }
 
   .main-container > .ai-banner,
   .main-container > .hero-heading-row,
@@ -1868,4 +1866,9 @@ kbd {
     align-content: start;
     gap: 6px;
   }
+}
+
+/* Keep scan history data available to existing session logic, but remove its panel from the UI. */
+.history-section {
+  display: none !important;
 }
