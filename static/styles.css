@@ -1582,23 +1582,46 @@ kbd {
     max-height: clamp(128px, 17vh, 168px);
   }
 }
-/* Reflow the full OCR workbench into two columns on roomy desktop viewports. */
+/* Keep the desktop OCR workbench in three readable columns on roomy screens. */
 @media (min-width: 1440px) and (min-height: 860px) {
   .topbar-inner {
     max-width: 1680px;
   }
 
+  html {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding-bottom: 0;
+  }
+
+  .topbar {
+    flex: 0 0 auto;
+  }
+
   .main-container {
     width: min(100% - 40px, 1680px);
-    margin-top: 10px;
+    flex: 1 1 0;
+    min-height: 0;
+    margin: 10px auto;
     display: grid;
-    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    grid-template-columns: minmax(320px, 0.92fr) minmax(360px, 1fr) minmax(500px, 1.38fr);
+    grid-template-rows: auto minmax(0, 1fr) clamp(96px, 12vh, 116px);
     grid-template-areas:
-      "banner hero"
-      "upload result"
-      "layout history";
-    align-items: start;
+      "banner hero hero"
+      "upload result layout"
+      "history history history";
+    align-items: stretch;
     gap: 10px;
+    overflow: hidden;
   }
 
   .main-container > .ai-banner { grid-area: banner; }
@@ -1607,6 +1630,21 @@ kbd {
   .main-container > .result-section-card { grid-area: result; }
   .main-container > .layout-section-card { grid-area: layout; }
   .main-container > .history-section { grid-area: history; }
+
+  .main-container > .ai-banner,
+  .main-container > .hero-heading-row,
+  .main-container > .upload-section-card,
+  .main-container > .result-section-card,
+  .main-container > .layout-section-card,
+  .main-container > .history-section {
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .ai-banner {
+    min-height: 42px;
+    padding-block: 7px;
+  }
 
   .hero-heading-row {
     align-items: center;
@@ -1618,49 +1656,70 @@ kbd {
     font-size: clamp(1.2rem, 2vw, 1.5rem);
   }
 
+  .kh-hero-sub {
+    margin-top: 2px;
+  }
+
+  .main-container > .upload-section-card,
+  .main-container > .result-section-card,
+  .main-container > .layout-section-card,
+  .main-container > .history-section {
+    overflow: hidden;
+  }
+
   .upload-section-card {
-    min-width: 0;
+    height: 100%;
     display: grid;
-    grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
-    align-content: start;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+    align-content: stretch;
     gap: 8px 12px;
+    padding: 14px 16px;
   }
 
   .upload-section-card > .dropzone {
     min-width: 0;
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
 
-  .upload-section-card > .controls-bar {
-    margin-top: 0;
-    padding-top: 0;
-    gap: 8px;
-    border-top: 0;
+  .upload-section-card > .dropzone > .dropzone-empty {
+    flex: 1 1 auto;
+    min-height: 68px;
   }
 
-  .upload-section-card > .live-progress-wrap,
-  .upload-section-card > .metrics-bar {
-    grid-column: 1 / -1;
-    margin-top: 0;
-  }
-
-  .preview-container {
+  .upload-section-card > .dropzone > .preview-container {
+    flex: 1 1 auto;
+    min-height: 0;
     padding: 8px;
     gap: 6px;
   }
 
-  .detection-legend-bar {
+  .upload-section-card .detection-legend-bar {
     min-height: 32px;
     padding-block: 4px;
   }
 
-  .preview-canvas-wrap {
-    height: clamp(200px, 32vh, 286px);
-    max-height: clamp(200px, 32vh, 286px);
+  .upload-section-card > .dropzone > .preview-container > .preview-canvas-wrap {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0;
+    max-height: none;
     padding: 6px;
   }
 
-  #imagePreview {
-    max-height: clamp(180px, calc(32vh - 14px), 272px);
+  .upload-section-card #imagePreview {
+    max-height: min(calc(42vh - 18px), 460px);
+  }
+
+  .upload-section-card > .controls-bar {
+    align-self: start;
+    margin-top: 0;
+    padding-top: 0;
+    gap: 8px;
+    border-top: 0;
   }
 
   .upload-section-card .controls-grid-3 {
@@ -1692,13 +1751,32 @@ kbd {
     flex: 1 1 140px;
   }
 
-  .result-section-card {
-    min-width: 0;
+  .upload-section-card > .live-progress-wrap,
+  .upload-section-card > .metrics-bar {
+    margin-top: 0;
   }
 
-  .result-section-card .section-bar {
-    align-items: stretch;
+  .result-section-card,
+  .layout-section-card {
+    min-width: 0;
+    padding: 14px 16px;
+  }
+
+  .result-section-card,
+  .layout-section-card,
+  .history-section {
+    height: 100%;
+    display: flex;
     flex-direction: column;
+  }
+
+  .result-section-card > .section-bar,
+  .layout-section-card > .section-bar {
+    flex: 0 0 auto;
+  }
+
+  .result-section-card > .section-bar {
+    align-items: stretch;
     gap: 6px;
     margin-bottom: 8px;
   }
@@ -1714,153 +1792,6 @@ kbd {
   .result-section-card .ocr-textarea,
   .result-section-card .compare-textarea {
     min-height: clamp(120px, 15vh, 144px);
-    overflow-y: auto;
-  }
-
-  .result-section-card .regions-list {
-    max-height: clamp(120px, 15vh, 144px);
-  }
-
-  .layout-section-card,
-  .history-section {
-    min-width: 0;
-    padding: 14px 16px;
-  }
-
-  .layout-section-card .section-bar {
-    gap: 6px;
-    margin-bottom: 8px;
-  }
-
-  .layout-section-card .page-layout-outer-stage {
-    height: clamp(180px, 22vh, 208px);
-    max-height: clamp(180px, 22vh, 208px);
-    padding: 8px;
-    overflow: auto;
-  }
-
-  .history-header {
-    margin-bottom: 8px;
-  }
-
-  .history-list {
-    max-height: clamp(60px, 10vh, 90px);
-    overflow-y: auto;
-    align-content: start;
-    gap: 6px;
-  }
-}
-/* Bound the desktop workbench to the viewport and scroll long panel content inside. */
-@media (min-width: 1440px) and (min-height: 860px) {
-  html {
-    height: 100%;
-    overflow: hidden;
-  }
-
-  body {
-    height: 100vh;
-    height: 100dvh;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    padding-bottom: 0;
-  }
-
-  .topbar {
-    flex: 0 0 auto;
-  }
-
-  .main-container {
-    flex: 1 1 0;
-    min-height: 0;
-    margin: 10px auto;
-    overflow: hidden;
-    grid-template-rows:
-      auto
-      minmax(0, 1.15fr)
-      minmax(0, 0.8fr)
-      clamp(110px, 13vh, 126px);
-    grid-template-areas:
-      "banner hero"
-      "upload result"
-      "upload layout"
-      "history history";
-    align-items: stretch;
-  }
-
-  .main-container > .ai-banner,
-  .main-container > .hero-heading-row,
-  .main-container > .upload-section-card,
-  .main-container > .result-section-card,
-  .main-container > .layout-section-card,
-  .main-container > .history-section {
-    min-width: 0;
-    min-height: 0;
-  }
-
-  .main-container > .upload-section-card,
-  .main-container > .result-section-card,
-  .main-container > .layout-section-card,
-  .main-container > .history-section {
-    overflow: hidden;
-  }
-
-  .upload-section-card {
-    height: 100%;
-    grid-template-rows: minmax(0, 1fr) auto;
-    align-content: stretch;
-  }
-
-  .upload-section-card > .dropzone {
-    height: 100%;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .upload-section-card > .dropzone > .dropzone-empty {
-    flex: 1 1 auto;
-    min-height: 68px;
-  }
-
-  .upload-section-card > .dropzone > .preview-container {
-    flex: 1 1 auto;
-    min-height: 0;
-  }
-
-  .upload-section-card > .dropzone > .preview-container > .preview-canvas-wrap {
-    flex: 1 1 auto;
-    height: auto;
-    min-height: 0;
-    max-height: none;
-  }
-
-  #imagePreview {
-    max-height: min(calc(52vh - 18px), 460px);
-  }
-
-  .upload-section-card > .controls-bar {
-    align-self: start;
-  }
-
-  .upload-section-card > .live-progress-wrap,
-  .upload-section-card > .metrics-bar {
-    margin-top: 0;
-  }
-
-  .result-section-card,
-  .layout-section-card,
-  .history-section {
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .result-section-card > .section-bar,
-  .layout-section-card > .section-bar,
-  .history-section > .history-header {
-    flex: 0 0 auto;
   }
 
   .result-section-card > #singleOutputWrap,
@@ -1894,7 +1825,7 @@ kbd {
   }
 
   .result-section-card > #compareOutputWrap {
-    overflow: hidden;
+    overflow: auto;
   }
 
   .result-section-card .compare-card {
@@ -1915,11 +1846,17 @@ kbd {
     overflow: auto;
   }
 
+  .layout-section-card .section-bar {
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
   .history-section {
     padding: 10px 12px;
   }
 
   .history-section > .history-header {
+    flex: 0 0 auto;
     margin-bottom: 6px;
   }
 
