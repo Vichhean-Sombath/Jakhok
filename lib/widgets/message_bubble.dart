@@ -14,13 +14,98 @@ class ChatMessage {
     this.streaming = false,
     this.attachment,
     this.replyTo,
+    this.isExtractedText = false,
   });
   String text;
   final bool isUser;
   bool streaming;
   final ScannedDocument? attachment;
   final ChatMessage? replyTo;
+  final bool isExtractedText;
 }
+
+bool looksLikeExtractedTextMessage(String text) =>
+    text.contains('```text\n') &&
+    (text.startsWith('Here’s the text I extracted from **') ||
+        text.contains('text extracted from **'));
+
+String extractedTextFromMessage(String text) {
+  final legacy = RegExp(r'```text\n([\s\S]*?)\n```').firstMatch(text);
+  return legacy?.group(1) ?? text;
+}
+
+String _readableExtractedText(String text) {
+  var result = extractedTextFromMessage(
+    text,
+  ).replaceAll('\r\n', '\n').replaceAll('\\\\', '\\');
+  const replacements = {
+    r'\operatorname*{lim}': 'lim',
+    r'\operatorname{lim}': 'lim',
+    r'\to': '→',
+    r'\rightarrow': '→',
+    r'\times': '×',
+    r'\cdot': '·',
+    r'\div': '÷',
+    r'\pm': '±',
+    r'\neq': '≠',
+    r'\le': '≤',
+    r'\ge': '≥',
+    r'\infty': '∞',
+    r'\pi': 'π',
+    r'\left': '',
+    r'\right': '',
+  };
+  for (final entry in replacements.entries) {
+    result = result.replaceAll(entry.key, entry.value);
+  }
+  result = result.replaceAllMapped(
+    RegExp(r'\\lim_\{x→(\d+)\}'),
+    (match) => 'limₓ→${_subscriptDigits(match[1]!)}',
+  );
+  result = result.replaceAllMapped(
+    RegExp(r'\\?sqrt(?:\[([^\]]+)\])?\{([^{}]+)\}'),
+    (match) {
+      final index = match[1];
+      final root = switch (index) {
+        '2' => '√',
+        '3' => '∛',
+        null => '√',
+        _ => '√₍$index₎',
+      };
+      return '$root(${match[2]})';
+    },
+  );
+  result = result.replaceAllMapped(
+    RegExp(r'\\?operatorname\*?\{l\s*i\s*m\}'),
+    (_) => 'lim',
+  );
+  result = result.replaceAllMapped(
+    RegExp(r'\\?frac\{([^{}]+)\}\{([^{}]+)\}'),
+    (match) => '(${match[1]})/(${match[2]})',
+  );
+  result = result.replaceAllMapped(
+    RegExp(r'\^\{?(\d+)\}?'),
+    (match) => _superscriptDigits(match[1]!),
+  );
+  result = result.replaceAllMapped(
+    RegExp(r'_\{?(\d+)\}?'),
+    (match) => _subscriptDigits(match[1]!),
+  );
+  return result
+      .replaceAll(r'\{', '{')
+      .replaceAll(r'\}', '}')
+      .replaceAll(r'\_', '_')
+      .replaceAll(RegExp(r'\\\s*'), '\n')
+      .replaceAll(RegExp(r'\n{3,}'), '\n\n')
+      .trim();
+}
+
+String _mapDigits(String value, String digits) =>
+    value.split('').map((digit) => digits[int.parse(digit)]).join();
+
+String _superscriptDigits(String value) => _mapDigits(value, '⁰¹²³⁴⁵⁶⁷⁸⁹');
+
+String _subscriptDigits(String value) => _mapDigits(value, '₀₁₂₃₄₅₆₇₈₉');
 
 class MessageBubble extends StatelessWidget {
   const MessageBubble({super.key, required this.message, this.onReply});
@@ -114,16 +199,24 @@ class MessageBubble extends StatelessWidget {
           ),
           Expanded(
             child: FractionallySizedBox(
-              widthFactor: .82,
+              widthFactor:
+                  message.isExtractedText ||
+                      looksLikeExtractedTextMessage(message.text)
+                  ? .96
+                  : .82,
               alignment: Alignment.topLeft,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _AssistantText(
-                    text: message.text,
-                    streaming: message.streaming,
-                  ),
+                  if (message.isExtractedText ||
+                      looksLikeExtractedTextMessage(message.text))
+                    _ExtractedTextCard(text: message.text)
+                  else
+                    _AssistantText(
+                      text: message.text,
+                      streaming: message.streaming,
+                    ),
                   if (!message.streaming && message.text.trim().isNotEmpty)
                     Wrap(
                       spacing: 0,
@@ -136,12 +229,23 @@ class MessageBubble extends StatelessWidget {
                         ),
                         _MessageAction(
                           label: 'Copy',
-                          onPressed: () => _copyMessage(context, message.text),
+                          onPressed: () => _copyMessage(
+                            context,
+                            message.isExtractedText ||
+                                    looksLikeExtractedTextMessage(message.text)
+                                ? extractedTextFromMessage(message.text)
+                                : message.text,
+                          ),
                         ),
                         _MessageAction(
                           label: 'Download',
-                          onPressed: () =>
-                              _downloadMessage(context, message.text),
+                          onPressed: () => _downloadMessage(
+                            context,
+                            message.isExtractedText ||
+                                    looksLikeExtractedTextMessage(message.text)
+                                ? extractedTextFromMessage(message.text)
+                                : message.text,
+                          ),
                         ),
                       ],
                     ),
@@ -212,6 +316,55 @@ class MessageBubble extends StatelessWidget {
           savedPath == null ? 'Download cancelled' : 'Response downloaded',
         ),
       ),
+    );
+  }
+}
+
+class _ExtractedTextCard extends StatelessWidget {
+  const _ExtractedTextCard({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final codeBlock = RegExp(r'```text\n([\s\S]*?)\n```').firstMatch(text);
+    final introduction = codeBlock == null
+        ? ''
+        : text.substring(0, codeBlock.start).trim();
+    final content = codeBlock?.group(1) ?? extractedTextFromMessage(text);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (introduction.isNotEmpty) ...[
+          MarkdownBody(
+            data: introduction,
+            selectable: true,
+            styleSheet: MarkdownStyleSheet.fromTheme(
+              theme,
+            ).copyWith(p: theme.textTheme.bodyLarge?.copyWith(height: 1.55)),
+          ),
+          const SizedBox(height: 8),
+        ],
+        Container(
+          width: double.infinity,
+          margin: const EdgeInsets.only(top: 8),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: theme.brightness == Brightness.dark
+                ? const Color(0xFF262626)
+                : const Color(0xFFF7F7F7),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: theme.dividerColor.withValues(alpha: .45),
+            ),
+          ),
+          child: SelectableText(
+            _readableExtractedText(content),
+            style: theme.textTheme.bodyLarge?.copyWith(height: 1.75),
+          ),
+        ),
+      ],
     );
   }
 }

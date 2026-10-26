@@ -31,50 +31,19 @@
 
   <title>Jakhok</title>
   <link rel="manifest" href="manifest.json">
-  <script>
-    window.recognizeImageWithTesseract = async function (base64Image) {
-      if (!window.Tesseract) {
-        window.__tesseractLoad ??= new Promise((resolve, reject) => {
-          const script = document.createElement('script');
-          script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-          script.onload = resolve;
-          script.onerror = () => reject(new Error('Could not load the web OCR engine.'));
-          document.head.appendChild(script);
-        });
-        await window.__tesseractLoad;
-      }
-      if (!window.__tesseractWorker) {
-        window.__tesseractWorker = window.Tesseract.createWorker(
-          'khm+eng',
-          1,
-          {
-            logger: (message) => {
-              if (typeof window.onOcrProgress === 'function') {
-                window.onOcrProgress(message.status, message.progress);
-              }
-            },
-          },
-        ).catch((error) => {
-          window.__tesseractWorker = null;
-          throw error;
-        });
-      }
-      const worker = await window.__tesseractWorker;
-      const image = await fetch(
-        `data:application/octet-stream;base64,${base64Image}`,
-      ).then((response) => response.blob());
-      try {
-        const result = await worker.recognize(image);
-        return result.data.text || '';
-      } catch (error) {
-        window.__tesseractWorker = null;
-        await worker.terminate();
-        throw error;
-      }
-    };
-  </script>
+
 </head>
 <body>
+  <script src='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.min.mjs' type='module'></script>
+  <script type='module'>
+  var { pdfjsLib } = globalThis;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.worker.mjs';
+
+  var pdfRenderOptions = {
+    cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/cmaps/',
+    cMapPacked: true,
+  }
+  </script>
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader

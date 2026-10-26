@@ -5,7 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
@@ -14,9 +14,8 @@ import 'package:pdfx/pdfx.dart';
 import '../app_state.dart';
 import '../models/document.dart';
 import '../services/file_text_extractor.dart';
-import '../services/image_ocr_stub.dart'
-    if (dart.library.html) '../services/image_ocr_web.dart'
-    as web_image_ocr;
+import '../services/ocr_api_client.dart';
+import '../services/pdf_ocr.dart';
 import '../widgets/scan_overlay.dart';
 import 'chat_screen.dart';
 
@@ -46,6 +45,8 @@ class _ScanScreenState extends State<ScanScreen> {
   List<int>? _documentBytes;
   bool _cameraUnavailable = false;
   bool _busy = false;
+  final _ocr = OcrApiClient();
+  int _scanVersion = 0;
   String? _ocrStatus;
   bool _flash = false;
   String? _error;
@@ -81,6 +82,9 @@ class _ScanScreenState extends State<ScanScreen> {
       final bytes = await picked.readAsBytes();
       if (!mounted) return;
       setState(() {
+        _scanVersion++;
+        _busy = false;
+        _ocrStatus = null;
         _image = File(picked.path);
         _imageBytes = bytes;
         _documentName = null;
@@ -98,6 +102,11 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 
   void _retake() {
+    setState(() {
+      _scanVersion++;
+      _busy = false;
+      _ocrStatus = null;
+    });
     if (widget.openCameraInitially && !kIsWeb) {
       _takeSystemPhoto();
       return;
@@ -165,6 +174,8 @@ class _ScanScreenState extends State<ScanScreen> {
 
   @override
   void dispose() {
+    _scanVersion++;
+    _ocr.close();
     _camera?.dispose();
     super.dispose();
   }
@@ -174,8 +185,12 @@ class _ScanScreenState extends State<ScanScreen> {
       final shot = await _camera?.takePicture();
       if (shot != null && mounted) {
         final bytes = await shot.readAsBytes();
+        if (!mounted) return;
         setState(() {
-          _image = File(shot.path);
+          _scanVersion++;
+          _busy = false;
+          _ocrStatus = null;
+          _image = kIsWeb ? null : File(shot.path);
           _imageBytes = bytes;
           _documentName = null;
           _documentBytes = null;
@@ -199,7 +214,11 @@ class _ScanScreenState extends State<ScanScreen> {
       );
       if (picked != null && mounted) {
         final bytes = await picked.readAsBytes();
+        if (!mounted) return;
         setState(() {
+          _scanVersion++;
+          _busy = false;
+          _ocrStatus = null;
           _image = kIsWeb ? null : File(picked.path);
           _imageBytes = bytes;
           _documentName = null;
@@ -244,6 +263,7 @@ class _ScanScreenState extends State<ScanScreen> {
         return;
       }
       final bytes = await picked.readAsBytes();
+      if (!mounted) return;
       if (_isImageFile(extension, bytes)) {
         var path = kIsWeb ? null : picked.path;
         if (path == null && !kIsWeb) {
@@ -254,7 +274,11 @@ class _ScanScreenState extends State<ScanScreen> {
           await imageFile.writeAsBytes(bytes, flush: true);
           path = imageFile.path;
         }
+        if (!mounted) return;
         setState(() {
+          _scanVersion++;
+          _busy = false;
+          _ocrStatus = null;
           _image = path == null ? null : File(path);
           _imageBytes = Uint8List.fromList(bytes);
           _documentName = null;
@@ -263,6 +287,9 @@ class _ScanScreenState extends State<ScanScreen> {
         });
       } else {
         setState(() {
+          _scanVersion++;
+          _busy = false;
+          _ocrStatus = null;
           _image = null;
           _imageBytes = null;
           _documentName = picked.name;
@@ -328,52 +355,42 @@ class _ScanScreenState extends State<ScanScreen> {
       _ocrStatus = 'Preparing OCR…';
       _error = null;
     });
-    TextRecognizer? recognizer;
+    final version = ++_scanVersion;
+    bool active() =>
+        mounted &&
+        version == _scanVersion &&
+        (ModalRoute.of(context)?.isCurrent ?? false);
+    final sourceImage = _image;
+    final sourceBytes = _imageBytes;
+    final sourceName = _documentName;
+    final documentBytes = _documentBytes;
     try {
       String text;
       if (_hasImage) {
-        if (kIsWeb) {
-          text = (await web_image_ocr.recognizeImage(
-            _imageBytes!,
-            onProgress: (status) {
-              if (mounted) setState(() => _ocrStatus = _friendlyOcrStatus(status));
-            },
-          )).trim();
-        } else {
-          final image = _image;
-          if (image == null) {
-            throw UnsupportedError(
-              'Image OCR is unavailable on this platform.',
-            );
-          }
-          recognizer = TextRecognizer(script: TextRecognitionScript.latin);
-          final result = await recognizer.processImage(
-            InputImage.fromFilePath(image.path),
-          );
-          text = result.text.trim();
-        }
+        await _ocr.ensureReady();
+        if (!active()) return;
+        setState(() => _ocrStatus = 'Reading text…');
+        text = await _ocr.recognizeImage(sourceBytes!);
       } else {
-        if (_isPdfFile(_documentName!, _documentBytes!)) {
+        if (_isPdfFile(sourceName!, documentBytes!)) {
           final pageTexts = await FileTextExtractor.extractPdfPages(
-            _documentBytes!,
+            documentBytes,
           );
           if (pageTexts.any((pageText) => pageText.isEmpty)) {
-            recognizer = TextRecognizer(script: TextRecognitionScript.latin);
-            text = await _extractScannedPdf(
-              _documentBytes!,
-              pageTexts,
-              recognizer,
-            );
+            await _ocr.ensureReady();
+            if (!active()) return;
+            text = await _extractScannedPdf(documentBytes, pageTexts, active);
           } else {
             text = pageTexts.join('\n\n');
           }
         } else {
           text = (await FileTextExtractor.extract(
-            _documentName!,
-            _documentBytes!,
+            sourceName,
+            documentBytes,
           )).trim();
         }
       }
+      if (!active()) return;
       if (text.isEmpty) {
         setState(() {
           _error = _hasImage
@@ -386,24 +403,25 @@ class _ScanScreenState extends State<ScanScreen> {
       }
       final now = DateTime.now();
       var savedImagePath = '';
-      if (_image != null) {
+      if (sourceImage != null) {
         final appDirectory = await getApplicationDocumentsDirectory();
         final imageDirectory = Directory('${appDirectory.path}/scans');
         await imageDirectory.create(recursive: true);
-        final savedImage = await _image!.copy(
+        final savedImage = await sourceImage.copy(
           '${imageDirectory.path}/${now.microsecondsSinceEpoch}.jpg',
         );
         savedImagePath = savedImage.path;
       }
+      if (!active()) return;
       final doc = ScannedDocument(
         id: '${now.microsecondsSinceEpoch}',
         name:
-            _documentName ??
+            sourceName ??
             'Scan_${now.year}${_two(now.month)}${_two(now.day)}_${_two(now.hour)}${_two(now.minute)}${_two(now.second)}',
         createdAt: now,
         imagePath: savedImagePath,
         text: text,
-        imageBytes: _imageBytes,
+        imageBytes: sourceBytes,
       );
       await widget.state.addDocument(doc);
       if (!mounted) return;
@@ -420,8 +438,16 @@ class _ScanScreenState extends State<ScanScreen> {
           ),
         ),
       );
+    } on OcrException catch (error) {
+      if (active()) {
+        setState(() {
+          _error = error.message;
+          _busy = false;
+          _ocrStatus = null;
+        });
+      }
     } on UnsupportedError catch (error) {
-      if (mounted) {
+      if (active()) {
         setState(() {
           _error =
               error.message?.toString() ??
@@ -431,7 +457,7 @@ class _ScanScreenState extends State<ScanScreen> {
         });
       }
     } catch (_) {
-      if (mounted)
+      if (active())
         setState(() {
           _error = kIsWeb && _hasImage
               ? 'Could not recognize text in this image. Check your connection and try again.'
@@ -439,66 +465,45 @@ class _ScanScreenState extends State<ScanScreen> {
           _busy = false;
           _ocrStatus = null;
         });
-    } finally {
-      await recognizer?.close();
     }
-  }
-
-  String _friendlyOcrStatus(String status) {
-    final value = status.toLowerCase();
-    if (value.contains('traineddata') || value.contains('language')) {
-      return 'Loading language data…';
-    }
-    if (value.contains('recogniz')) return 'Reading text…';
-    if (value.contains('core') || value.contains('initializ')) {
-      return 'Preparing OCR…';
-    }
-    return 'Processing image…';
   }
 
   Future<String> _extractScannedPdf(
     List<int> bytes,
     List<String> pageTexts,
-    TextRecognizer recognizer,
+    bool Function() active,
   ) async {
     final pdf = await PdfDocument.openData(Uint8List.fromList(bytes));
-    final tempDirectory = await getTemporaryDirectory();
     try {
-      for (var pageNumber = 1; pageNumber <= pdf.pagesCount; pageNumber++) {
-        if (pageNumber <= pageTexts.length &&
-            pageTexts[pageNumber - 1].isNotEmpty) {
-          continue;
-        }
-        final page = await pdf.getPage(pageNumber);
-        try {
-          final image = await page.render(
-            width: page.width * 2,
-            height: page.height * 2,
-            format: PdfPageImageFormat.png,
-          );
-          if (image == null) continue;
-          final imageFile = File(
-            '${tempDirectory.path}/pdf_ocr_${DateTime.now().microsecondsSinceEpoch}_$pageNumber.png',
-          );
-          try {
-            await imageFile.writeAsBytes(image.bytes, flush: true);
-            final pageText = await recognizer.processImage(
-              InputImage.fromFilePath(imageFile.path),
-            );
-            if (pageText.text.trim().isNotEmpty) {
-              pageTexts[pageNumber - 1] = pageText.text.trim();
-            }
-          } finally {
-            if (await imageFile.exists()) await imageFile.delete();
+      return await fillMissingPdfText(
+        pageTexts: pageTexts,
+        isActive: active,
+        onProgress: (page, total) {
+          if (active()) {
+            setState(() => _ocrStatus = 'Reading page $page/$total…');
           }
-        } finally {
-          await page.close();
-        }
-      }
+        },
+        recognize: (bytes) => _ocr.recognizeImage(bytes, filename: 'page.png'),
+        renderPage: (number) async {
+          final page = await pdf.getPage(number);
+          try {
+            final image = await page.render(
+              width: page.width * 2,
+              height: page.height * 2,
+              format: PdfPageImageFormat.png,
+            );
+            if (image == null) {
+              throw OcrException('Could not render PDF page $number.');
+            }
+            return image.bytes;
+          } finally {
+            await page.close();
+          }
+        },
+      );
     } finally {
       await pdf.close();
     }
-    return pageTexts.join('\n\n');
   }
 
   String _two(int n) => n.toString().padLeft(2, '0');

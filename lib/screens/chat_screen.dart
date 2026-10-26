@@ -85,6 +85,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   item['attachmentDocumentId'] as String?,
                 ),
                 replyTo: replyTo,
+                isExtractedText:
+                    item['isExtractedText'] as bool? ??
+                    looksLikeExtractedTextMessage(item['text'] as String),
               );
             }),
           );
@@ -99,10 +102,9 @@ class _ChatScreenState extends State<ChatScreen> {
       if (widget.showExtractedText && document != null) {
         _messages.add(
           ChatMessage(
-            text:
-                'Here’s the text I extracted from **${document.name}**:\n\n'
-                '```text\n${document.text}\n```',
+            text: document.text,
             isUser: false,
+            isExtractedText: true,
           ),
         );
       }
@@ -137,6 +139,7 @@ class _ChatScreenState extends State<ChatScreen> {
               (message) => {
                 'text': message.text,
                 'isUser': message.isUser,
+                'isExtractedText': message.isExtractedText,
                 'attachmentDocumentId': message.attachment?.id,
                 'replyToText': message.replyTo?.text,
                 'replyToIsUser': message.replyTo?.isUser,
