@@ -34,7 +34,20 @@ export function prepareRequest(req, res) {
     .map((value) => value.trim())
     .filter(Boolean);
   const origin = req.headers.origin;
-  if (origin && !allowed.includes(origin)) {
+  const isLocalDevelopmentOrigin = (() => {
+    if (!origin) return false;
+    try {
+      const parsed = new URL(origin);
+      return (
+        parsed.protocol === "http:" &&
+        (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") &&
+        parsed.origin === origin
+      );
+    } catch (_) {
+      return false;
+    }
+  })();
+  if (origin && !allowed.includes(origin) && !isLocalDevelopmentOrigin) {
     res.status(403).json({ error: "Origin is not allowed." });
     return false;
   }

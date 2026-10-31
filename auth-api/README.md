@@ -62,7 +62,7 @@ Add this compile-time value alongside the existing Firebase and OCR values:
   --dart-define=AUTH_API_BASE_URL=https://auth.neuroshift.dev
 ```
 
-For local Chrome development, the auth API accepts the current `localhost:8080` and `127.0.0.1:8080` origins by default. Add any deployed Flutter web hostname to `AUTH_ALLOWED_ORIGINS` before using it.
+For local Chrome development, the auth API accepts HTTP origins on `localhost` and `127.0.0.1` at any port, including Flutter's automatically selected random port. Add any deployed Flutter web hostname to `AUTH_ALLOWED_ORIGINS` before using it.
 
 ## Firestore cleanup
 
