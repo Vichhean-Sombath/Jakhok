@@ -20,6 +20,7 @@ export default async function handler(req, res) {
     return fail(res, 400, "Enter a valid email and password.");
   }
 
+  let stage = "firebase_password_auth";
   try {
     let result;
     if (mode === "register") {
@@ -32,7 +33,9 @@ export default async function handler(req, res) {
     } else {
       result = await firebasePasswordAuth("signInWithPassword", email, password);
     }
+    stage = "verify_firebase_id_token";
     const decoded = await verifyFirebaseIdToken(result.idToken);
+    stage = "create_otp_challenge";
     const challenge = await createChallenge({
       email: decoded.email || email,
       uid: decoded.uid,
@@ -43,6 +46,21 @@ export default async function handler(req, res) {
     return res.status(200).json(challenge);
   } catch (error) {
     const message = String(error?.message || "");
+    const diagnostic = {
+      stage: error?.authStage || stage,
+      errorName:
+        typeof error?.name === "string" && /^[A-Za-z0-9_]+$/.test(error.name)
+          ? error.name
+          : "Error",
+      code:
+        typeof error?.code === "string" && /^[A-Za-z0-9_/-]{1,80}$/.test(error.code)
+          ? error.code
+          : undefined,
+      statusCode: Number.isInteger(error?.statusCode)
+        ? error.statusCode
+        : undefined,
+    };
+    console.error("[auth/email/start] failed", diagnostic);
     if (message.includes("wait before requesting")) {
       return fail(res, 429, message);
     }

@@ -77,6 +77,19 @@ export function fail(res, status, message) {
   return res.status(status).json({ error: message });
 }
 
+function withAuthStage(error, authStage) {
+  const source =
+    error && typeof error === "object" ? error : new Error("Request failed.");
+  const diagnostic = new Error(source.message || "Request failed.", {
+    cause: source,
+  });
+  diagnostic.name = source.name || "Error";
+  diagnostic.code = source.code;
+  diagnostic.statusCode = source.statusCode;
+  diagnostic.authStage = authStage;
+  return diagnostic;
+}
+
 export function randomId() {
   return crypto.randomUUID();
 }
@@ -136,24 +149,37 @@ export async function applyRateLimits(email, req) {
 }
 
 export async function createChallenge({ email, uid, authTime, mode, req }) {
-  await applyRateLimits(email, req);
-  const { db } = firebase();
+  let db;
+  try {
+    ({ db } = firebase());
+  } catch (error) {
+    throw withAuthStage(error, "firebase_admin_init");
+  }
+  try {
+    await applyRateLimits(email, req);
+  } catch (error) {
+    throw withAuthStage(error, "rate_limit");
+  }
   const challengeId = randomId();
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   const expiresAt = Date.now() + CHALLENGE_TTL_MS;
   const ref = db.collection("auth_challenges").doc(challengeId);
-  await ref.create({
-    email,
-    uid,
-    authTime,
-    mode,
-    codeHash: hashOtp(challengeId, code),
-    attempts: 0,
-    verified: false,
-    used: false,
-    createdAt: FieldValue.serverTimestamp(),
-    expiresAt: Timestamp.fromMillis(expiresAt),
-  });
+  try {
+    await ref.create({
+      email,
+      uid,
+      authTime,
+      mode,
+      codeHash: hashOtp(challengeId, code),
+      attempts: 0,
+      verified: false,
+      used: false,
+      createdAt: FieldValue.serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(expiresAt),
+    });
+  } catch (error) {
+    throw withAuthStage(error, "firestore_challenge_write");
+  }
 
   let result;
   try {
@@ -165,13 +191,13 @@ export async function createChallenge({ email, uid, authTime, mode, req }) {
       text: `Your Jakhok verification code is ${code}. It expires in 10 minutes. If you did not request it, you can ignore this email.`,
       html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#111827"><h1 style="font-size:22px">Verify your Jakhok sign-in</h1><p>Enter this code in the app. It expires in 10 minutes.</p><p style="font-size:32px;font-weight:700;letter-spacing:8px;color:#1769ff">${code}</p><p style="color:#667085">If you did not request this code, you can ignore this email.</p></div>`,
     });
-  } catch (_) {
-    await ref.delete();
-    throw new Error("Email provider could not send the verification code.");
+  } catch (error) {
+    await ref.delete().catch(() => {});
+    throw withAuthStage(error, "resend_send");
   }
   if (result.error) {
-    await ref.delete();
-    throw new Error("Email provider could not send the verification code.");
+    await ref.delete().catch(() => {});
+    throw withAuthStage(result.error, "resend_rejected");
   }
   return { challengeId, expiresInSeconds: CHALLENGE_TTL_MS / 1000 };
 }
@@ -248,7 +274,17 @@ export async function firebasePasswordAuth(action, email, password) {
     body: JSON.stringify({ email, password, returnSecureToken: true }),
   });
   const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error("Email or password could not be verified.");
+  if (!response.ok) {
+    const rawCode = result.error?.message;
+    const candidate =
+      typeof rawCode === "string" ? rawCode.split(":", 1)[0].trim() : "";
+    const error = new Error("Email or password could not be verified.");
+    error.code = /^[A-Z0-9_]+$/.test(candidate)
+      ? candidate
+      : `HTTP_${response.status}`;
+    error.statusCode = response.status;
+    throw error;
+  }
   return result;
 }
 
