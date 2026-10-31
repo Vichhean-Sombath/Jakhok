@@ -39,7 +39,6 @@ Set these for Production and Preview as appropriate:
 | `RESEND_API_KEY` | Domain-scoped Resend Sending access key |
 | `RESEND_FROM_EMAIL` | `Jakhok <verify@mail.neuroshift.dev>` after Resend verifies `mail.neuroshift.dev` |
 | `OTP_HMAC_SECRET` | Random secret of at least 32 bytes |
-| `AUTH_ALLOWED_ORIGINS` | Comma-separated Flutter web origins, such as `http://127.0.0.1:8080,http://localhost:8080,https://your-app-domain` |
 
 Do not paste any of these secret values into chat or commit them to Git.
 
@@ -62,7 +61,7 @@ Add this compile-time value alongside the existing Firebase and OCR values:
   --dart-define=AUTH_API_BASE_URL=https://auth.neuroshift.dev
 ```
 
-For local Chrome development, the auth API accepts HTTP origins on `localhost` and `127.0.0.1` at any port, including Flutter's automatically selected random port. Add any deployed Flutter web hostname to `AUTH_ALLOWED_ORIGINS` before using it.
+The auth API allows browser requests from any origin. Firebase still requires the app's web domain to be listed under Authentication → Settings → Authorized domains for Google sign-in.
 
 ## Firestore cleanup
 

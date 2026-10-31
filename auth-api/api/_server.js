@@ -28,33 +28,7 @@ export function firebase() {
 }
 
 export function prepareRequest(req, res) {
-  const allowed = (process.env.AUTH_ALLOWED_ORIGINS ||
-    "http://localhost:8080,http://127.0.0.1:8080")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const origin = req.headers.origin;
-  const isLocalDevelopmentOrigin = (() => {
-    if (!origin) return false;
-    try {
-      const parsed = new URL(origin);
-      return (
-        parsed.protocol === "http:" &&
-        (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") &&
-        parsed.origin === origin
-      );
-    } catch (_) {
-      return false;
-    }
-  })();
-  if (origin && !allowed.includes(origin) && !isLocalDevelopmentOrigin) {
-    res.status(403).json({ error: "Origin is not allowed." });
-    return false;
-  }
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Cache-Control", "no-store");
