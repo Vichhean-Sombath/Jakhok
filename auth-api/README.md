@@ -2,6 +2,14 @@
 
 This is a small Node.js API for Vercel. It is separate from the L40S OCR app so login and email-code requests do not start an OCR GPU container.
 
+## Local development
+
+The API also has a Node standard-library development server. From this directory, run `npm run local`; it loads `.env.local` and binds only to `127.0.0.1:3000` (override the port with `LOCAL_AUTH_API_PORT`). Create `.env.local` from the required variables below, and set `LOCAL_ADMIN_OTP_BYPASS=1` only for local testing when needed. Do not commit `.env.local`.
+
+The OTP bypass is active only when that variable is exactly `1`, `VERCEL` is absent, and `NODE_ENV` is not `production`. It checks the current Firebase Admin user for the boolean custom claim `ocr_local_otp_bypass`; a claim supplied only in a client token is ignored. Session status and the signed-in-user OTP start route return `{ "verified": true }` for an eligible account. A successful email/password login returns `{ "verified": true, "customToken": "..." }`; registration still uses email OTP. The bypass does not create a 30-day verified-session record, and removing the current custom claim revokes the bypass. The API does not assign this claim.
+
+Run the offline checks with `npm test`.
+
 ## Routes
 
 - `POST /api/auth/email/start` validates Firebase email/password credentials or creates the Firebase account, then emails a code.
@@ -25,7 +33,7 @@ The API marks an email verified after the user proves control of that inbox with
 
 In Resend, add a sending domain and publish the SPF/DKIM records it shows in your Cloudflare DNS. Wait for Resend to verify the domain. Create a **Sending access** API key restricted to that domain and add it to Vercel as `RESEND_API_KEY`.
 
-The Resend sending domain for this project is `mail.neuroshift.dev`. After Resend shows it as verified, set `RESEND_FROM_EMAIL` to `Jakhok <verify@mail.neuroshift.dev>`.
+The verified Resend sending domain for this project is `mails.neuroshift.dev`. After Resend shows it as verified, set `RESEND_FROM_EMAIL` to `Jakhok <no-reply@mails.neuroshift.dev>`. The production `RESEND_FROM_EMAIL` environment variable must match this address exactly.
 
 ## Vercel environment variables
 
@@ -37,7 +45,7 @@ Set these for Production and Preview as appropriate:
 | `FIREBASE_WEB_API_KEY` | Firebase Web API key |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Entire service-account JSON, stored only in Vercel |
 | `RESEND_API_KEY` | Domain-scoped Resend Sending access key |
-| `RESEND_FROM_EMAIL` | `Jakhok <verify@mail.neuroshift.dev>` after Resend verifies `mail.neuroshift.dev` |
+| `RESEND_FROM_EMAIL` | `Jakhok <no-reply@mails.neuroshift.dev>` after Resend verifies `mails.neuroshift.dev` |
 | `OTP_HMAC_SECRET` | Random secret of at least 32 bytes |
 
 Do not paste any of these secret values into chat or commit them to Git.
@@ -48,7 +56,7 @@ Do not paste any of these secret values into chat or commit them to Git.
 2. Add the environment variables above in Vercel Project Settings.
 3. Deploy and confirm the Vercel URL responds to `POST /api/auth/session/status` with a JSON error when called without a token.
 4. Add `auth.neuroshift.dev` to the Vercel project's Domains settings. Vercel will show the exact DNS record for that project.
-5. In Cloudflare DNS, add the exact record Vercel provides for the `auth` hostname. Keep the existing records for `mail.neuroshift.dev`. Add Resend's SPF/DKIM records on the mail subdomain exactly as shown in Resend.
+5. In Cloudflare DNS, add the exact record Vercel provides for the `auth` hostname. Keep the existing records for `mails.neuroshift.dev`. Add Resend's SPF/DKIM records on the sending subdomain exactly as shown in Resend.
 6. Set `AUTH_API_BASE_URL=https://auth.neuroshift.dev` when building the Flutter app.
 
 Vercel's required CNAME value is project-specific; copy it from the Vercel domain screen rather than guessing it. If you have not chosen the actual domain yet, deploy first to the Vercel `.vercel.app` URL and add the custom domain later.

@@ -11,3 +11,27 @@ Thumbs.db
 checkpoints/
 merged_model/
 Khmer-OCR-App-Share.zip
+
+# Generated dependencies and build output
+node_modules/
+.next/
+*.tsbuildinfo
+coverage/
+dist/
+.theme-previews/
+
+# Flutter generated output (keep the Flutter source project)
+KhmerOCR-Flutter-Working/.dart_tool/
+KhmerOCR-Flutter-Working/build/
+KhmerOCR-Flutter-Working/.flutter-plugins
+KhmerOCR-Flutter-Working/.flutter-plugins-dependencies
+
+# Local deployment state and credential files
+.vercel/
+.firebase/
+*.service-account.json
+*service-account*.json
+*.pem
+*.key
+firebase-debug.log
+vercel-debug.log

@@ -3,6 +3,8 @@ import { getApps, initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { Resend } from "resend";
+import { assertFirebaseIdTokenShape } from "./_auth_errors.js";
+import { transactOtpRateLimits } from "./_rate_limits.js";
 
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -31,6 +33,7 @@ export function prepareRequest(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Expose-Headers", "Retry-After");
   res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") {
     res.status(204).end();
@@ -60,6 +63,7 @@ function withAuthStage(error, authStage) {
   diagnostic.name = source.name || "Error";
   diagnostic.code = source.code;
   diagnostic.statusCode = source.statusCode;
+  diagnostic.retryAfterSeconds = source.retryAfterSeconds;
   diagnostic.authStage = authStage;
   return diagnostic;
 }
@@ -92,34 +96,14 @@ export async function applyRateLimits(email, req) {
   const ip = typeof forwarded === "string" ? forwarded.split(",")[0].trim() : "unknown";
   const ipKey = digest(`ip:${ip}`);
   const now = Date.now();
-
-  async function consume(key, limit, intervalMs, minGapMs) {
-    const ref = db.collection("auth_rate_limits").doc(key);
-    return db.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      const row = snap.exists ? snap.data() : {};
-      const windowStart = row.windowStart?.toMillis?.() || 0;
-      const count = now - windowStart < intervalMs ? row.count || 0 : 0;
-      const lastSent = row.lastSent?.toMillis?.() || 0;
-      if (count >= limit || (lastSent && now - lastSent < minGapMs)) {
-        return false;
-      }
-      const nextWindowStart = count === 0 ? now : windowStart;
-      tx.set(ref, {
-        windowStart: Timestamp.fromMillis(nextWindowStart),
-        count: count + 1,
-        lastSent: Timestamp.fromMillis(now),
-        expiresAt: Timestamp.fromMillis(now + 24 * 60 * 60 * 1000),
-      });
-      return true;
-    });
-  }
-
-  const emailAllowed = await consume(emailKey, 5, 60 * 60 * 1000, 60 * 1000);
-  const ipAllowed = await consume(ipKey, 30, 60 * 60 * 1000, 10 * 1000);
-  if (!emailAllowed || !ipAllowed) {
-    throw new Error("Please wait before requesting another code.");
-  }
+  const collection = db.collection("auth_rate_limits");
+  await transactOtpRateLimits({
+    db,
+    emailRef: collection.doc(emailKey),
+    ipRef: collection.doc(ipKey),
+    now,
+    timestampFromMillis: (millis) => Timestamp.fromMillis(millis),
+  });
 }
 
 export async function createChallenge({ email, uid, authTime, mode, req }) {
@@ -177,9 +161,7 @@ export async function createChallenge({ email, uid, authTime, mode, req }) {
 }
 
 export async function verifyFirebaseIdToken(idToken) {
-  if (typeof idToken !== "string" || idToken.length < 40) {
-    throw new Error("Sign in again, then request a new code.");
-  }
+  assertFirebaseIdTokenShape(idToken);
   const { auth } = firebase();
   return auth.verifyIdToken(idToken, true);
 }

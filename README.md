@@ -33,11 +33,12 @@ A fast, modern web application for **Khmer Document & Text OCR** powered by your
    ```bash
    bash run_mac.command
    ```
-   *(On first run, it automatically creates `.venv`, installs native ARM64 Apple Silicon PyTorch + dependencies, and starts the app using the bundled `checkpoint-119114-adapter`.)*
-2. To pull the newest checkpoint from `dvdphobia/OpenKhmer-Private-Checkpoints` at any time:
+   *(On first run, use the updater command below to create `.venv`, install dependencies, sync the configured checkpoint, and start the app.)*
+2. To pull and activate the configured checkpoint before starting the app:
    ```bash
    bash update_latest_checkpoint_mac.command
    ```
+   To sync without starting FastAPI or loading the OCR model, run `./.venv/bin/python sync_checkpoint.py`.
 3. Open **[http://localhost:7860](http://localhost:7860)** in your browser.
 
 ### 🪟 Windows (NVIDIA RTX GPU — `CUDA`)
@@ -45,15 +46,20 @@ A fast, modern web application for **Khmer Document & Text OCR** powered by your
    ```powershell
    .\run.bat
    ```
-   *(On first run, it automatically creates `.venv`, installs CUDA PyTorch + dependencies, and starts the server.)*
-2. To pull the newest checkpoint from `dvdphobia/OpenKhmer-Private-Checkpoints` at any time, double-click **`update_latest_checkpoint.bat`**.
+   *(For first-time setup, double-click the updater below; it creates `.venv`, installs CUDA PyTorch + dependencies, syncs the configured checkpoint, and starts the server.)*
+2. To pull and activate the configured checkpoint, double-click **`update_latest_checkpoint.bat`**.
+   To sync without starting FastAPI or loading the OCR model, run `\.venv\Scripts\python.exe sync_checkpoint.py`.
 3. Open **[http://localhost:7860](http://localhost:7860)** in your browser.
 
 ### 🔐 Local Hugging Face credentials
 
 The app reads optional credentials from `.env` in the project folder. The checked-in `.env.example` is a blank template; copy it to `.env` if needed. Keep `.env` private and do not add it to a commit, notebook, or share archive.
 
-- Public downloads of `dvdphobia/Khmer-PaddleOCR-VL-LoRA` need no token. Leave `HF_PRIVATE_CHECKPOINT_TOKEN` empty to use the public fine-tuned model instead of syncing the private checkpoint.
+- Public downloads of `dvdphobia/Khmer-PaddleOCR-VL-LoRA` need no token; set `LORA_MODEL_ID=dvdphobia/Khmer-PaddleOCR-VL-LoRA` to select it explicitly.
+- The default `PRIVATE_RUN_ID` is `2aa94c1b9590b1f3`, the A100 phase. Its optimizer step (currently 2,600 from the Modal Volume) is distinct from its warm-start parent step (157,938). The app uses the EMA export from that phase's `adapter/` folder and keeps the parent lineage in checkpoint metadata; it does not combine weights across runs or phases.
+- The updater scripts set `AUTO_PULL_LATEST_CHECKPOINT=1`, fetch the configured run at one pinned Hugging Face revision, and activate it through `checkpoints/active_checkpoint.json`. Normal app startup uses that validated local marker offline. If no marker exists or it points to a different/invalid run, startup asks you to sync instead of selecting another checkpoint.
+- To sync without starting the app, run `python sync_checkpoint.py` from the project folder after dependencies are installed. Downloads are stored under `checkpoints/runs/<run-id>/phase-step-<step>-<content-id>/`; earlier checkpoint folders are preserved. Set `PRIVATE_RUN_ID` to select another run. An explicit `LORA_MODEL_ID` overrides checkpoint selection and skips all private checkpoint sync; use `LORA_MODEL_ID=dvdphobia/Khmer-PaddleOCR-VL-LoRA` to select that public adapter.
+- To import a checkpoint copied from the Modal Volume without claiming an HF revision, pass a local directory containing `state.json` and `adapter/`: `python sync_checkpoint.py --local-checkpoint <checkpoint-dir> --source-identity "Modal Volume checkpoint-000002600"`. The importer validates the same run/parent metadata and EMA adapter, records Modal provenance separately, and refuses to replace a newer active step with an older HF copy.
 - Only set `HF_PRIVATE_CHECKPOINT_TOKEN` on a trusted machine that needs private checkpoint sync. Use a fine-grained read token restricted to `dvdphobia/OpenKhmer-Private-Checkpoints`.
 - `HF_WRITE_TOKEN` is only for `merge_checkpoint.py` when publishing. Use a separate fine-grained write token restricted to the destination model repo.
 

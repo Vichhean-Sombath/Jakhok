@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -8,6 +10,7 @@ import os
 import pathlib
 import threading
 import time
+from collections import OrderedDict
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -15,6 +18,15 @@ from dotenv import load_dotenv
 # Load project-local secrets before importing Hugging Face libraries.
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=False)
+API_ONLY = os.environ.get("API_ONLY", "0") == "1"
+OCR_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "OCR_ALLOWED_ORIGINS",
+        "http://localhost:8080,http://127.0.0.1:8080,https://neuroshift.dev,https://www.neuroshift.dev",
+    ).split(",")
+    if origin.strip()
+]
 
 # Disable hf-xet chunked downloader which can hang on Windows / Cloudflare WARP
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -31,6 +43,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageFilter, ImageOps
+from checkpoint_sync import (
+    DEFAULT_A100_RUN_ID,
+    CheckpointOlderThanActiveError,
+    load_active_checkpoint,
+    resolve_adapter_override,
+    sync_latest_checkpoint,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,189 +63,92 @@ HF_PRIVATE_CHECKPOINT_TOKEN = os.environ.get("HF_PRIVATE_CHECKPOINT_TOKEN") or N
 PRIVATE_CHECKPOINT_REPO = os.environ.get(
     "PRIVATE_CHECKPOINT_REPO", "dvdphobia/OpenKhmer-Private-Checkpoints"
 )
-PRIVATE_RUN_ID = os.environ.get("PRIVATE_RUN_ID", "d84cd55f108195b1")
+PRIVATE_RUN_ID = os.environ.get("PRIVATE_RUN_ID", DEFAULT_A100_RUN_ID)
 _CHECKPOINTS_ROOT = pathlib.Path(__file__).parent / "checkpoints"
-
-
-def _build_or_get_ema_soup_adapter() -> Optional[ tuple[pathlib.Path, str] ]:
-    """
-    Combines available Vision+Language LoRA checkpoints (576-tensor adapters) using
-    Exponential / Weighted Model Souping so single-step high-LR oscillations cancel out.
-    """
-    if not _CHECKPOINTS_ROOT.exists():
-        return None
-    try:
-        from safetensors.torch import load_file, save_file
-
-        vision_ckpts: list[tuple[int, pathlib.Path]] = []
-        for d in _CHECKPOINTS_ROOT.iterdir():
-            if not d.is_dir() or "soup" in d.name:
-                continue
-            sf = d / "adapter_model.safetensors"
-            cfg = d / "adapter_config.json"
-            if sf.exists() and cfg.exists():
-                parts = d.name.split("-")
-                step_num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-                if step_num >= 110000:
-                    vision_ckpts.append((step_num, d))
-
-        if len(vision_ckpts) < 2:
-            return None
-
-        vision_ckpts.sort(key=lambda x: x[0])
-        max_step = vision_ckpts[-1][0]
-        soup_dir = _CHECKPOINTS_ROOT / "checkpoint-ema-soup-adapter"
-        stamp_file = soup_dir / "soup_meta.json"
-        source_steps = [s for s, _ in vision_ckpts]
-
-        if (soup_dir / "adapter_model.safetensors").exists() and stamp_file.exists():
-            try:
-                meta = json.loads(stamp_file.read_text(encoding="utf-8"))
-                if meta.get("source_steps") == source_steps:
-                    return (
-                        soup_dir,
-                        f"OpenKhmer {max_step / 1000:.1f}k EMA-Soup Vision+Language LoRA ({len(source_steps)} ckpts)",
-                    )
-            except Exception:
-                pass
-
-        # Anchor checkpoints that excelled across printed, org-chart, handwritten, and poem domains
-        preferred_weights = {
-            110000: 0.18,
-            119114: 0.22,
-            122000: 0.35,
-            133000: 0.15,
-            134000: 0.10,
-        }
-        weighted_list: list[tuple[float, pathlib.Path, int]] = []
-        for step_num, d in vision_ckpts:
-            w = preferred_weights.get(step_num, 0.12 if step_num == max_step else 0.05)
-            weighted_list.append((w, d, step_num))
-
-        total_w = sum(w for w, _, _ in weighted_list)
-        weighted_list = [(w / total_w, d, s) for w, d, s in weighted_list]
-
-        soup_dir.mkdir(parents=True, exist_ok=True)
-        latest_dir = vision_ckpts[-1][1]
-        import shutil
-
-        for item in latest_dir.iterdir():
-            if item.is_file() and item.name != "adapter_model.safetensors":
-                shutil.copy2(item, soup_dir / item.name)
-
-        loaded = [(load_file(str(d / "adapter_model.safetensors")), w) for w, d, _ in weighted_list]
-        avg_tensors = {}
-        first_tensors = loaded[0][0]
-        for k in first_tensors.keys():
-            acc = sum(t_dict[k].float() * w for t_dict, w in loaded)
-            avg_tensors[k] = acc.to(first_tensors[k].dtype)
-
-        save_file(avg_tensors, str(soup_dir / "adapter_model.safetensors"))
-        stamp_file.write_text(
-            json.dumps({"source_steps": source_steps, "max_step": max_step}, indent=2),
-            encoding="utf-8",
-        )
-        return (
-            soup_dir,
-            f"OpenKhmer {max_step / 1000:.1f}k EMA-Soup Vision+Language LoRA ({len(source_steps)} ckpts)",
-        )
-    except Exception as exc:
-        logger.warning(f"EMA soup build skipped: {exc}")
-        return None
-
-
-def _find_highest_local_adapter() -> pathlib.Path:
-    if _CHECKPOINTS_ROOT.exists():
-        candidates: list[tuple[int, pathlib.Path]] = []
-        for d in _CHECKPOINTS_ROOT.iterdir():
-            if d.is_dir() and "soup" not in d.name and (d / "adapter_model.safetensors").exists():
-                parts = d.name.split("-")
-                step_num = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-                candidates.append((step_num, d))
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            return candidates[0][1]
-    return _CHECKPOINTS_ROOT / "checkpoint-134000-adapter"
 
 
 def ensure_latest_private_adapter() -> tuple[str, str]:
     """
-    Ensures the private OpenKhmer Vision+Language LoRA checkpoint is available locally.
-    If `AUTO_PULL_LATEST_CHECKPOINT=1` is set or the local adapter directory is missing,
-    it automatically downloads `runs/<PRIVATE_RUN_ID>/checkpoint-latest` using
-    `HF_PRIVATE_CHECKPOINT_TOKEN` from the local `.env` file.
+    Resolve the activated run/phase/step without mixing adapters from other runs.
+    Explicit sync failures are fatal; normal startup uses a validated local marker.
     """
     auto_pull = os.environ.get("AUTO_PULL_LATEST_CHECKPOINT", "0") == "1"
-    best_local = _find_highest_local_adapter()
-    if not auto_pull and (best_local / "adapter_model.safetensors").exists():
-        soup = _build_or_get_ema_soup_adapter()
-        if soup is not None:
-            return str(soup[0]), soup[1]
-        parts = best_local.name.split("-")
-        step_val = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 134000
-        return (
-            str(best_local),
-            f"OpenKhmer {step_val / 1000:.1f}k-step Vision+Language LoRA ({best_local.name})",
-        )
-
-    try:
-        import shutil
-        from huggingface_hub import hf_hub_download, snapshot_download
-
-        prefix = f"runs/{PRIVATE_RUN_ID}/checkpoint-latest"
-        state_path = hf_hub_download(
+    if auto_pull:
+        try:
+            manifest = sync_latest_checkpoint(
+                repo_id=PRIVATE_CHECKPOINT_REPO,
+                run_id=PRIVATE_RUN_ID,
+                token=HF_PRIVATE_CHECKPOINT_TOKEN,
+                checkpoints_root=_CHECKPOINTS_ROOT,
+                base_model_id=BASE_MODEL_ID,
+            )
+        except CheckpointOlderThanActiveError as exc:
+            manifest = load_active_checkpoint(
+                checkpoints_root=_CHECKPOINTS_ROOT,
+                run_id=PRIVATE_RUN_ID,
+                repo_id=PRIVATE_CHECKPOINT_REPO,
+                base_model_id=BASE_MODEL_ID,
+            )
+            if manifest is None or int(manifest["optimizer_step"]) <= exc.incoming_step:
+                raise RuntimeError(
+                    f"HF checkpoint is older than step {exc.active_step}, but no valid newer active "
+                    "checkpoint is available."
+                ) from None
+            logger.warning(
+                "HF latest is step %s; keeping validated active step %s from %s and starting with it.",
+                exc.incoming_step, manifest["optimizer_step"],
+                manifest.get("source_identity") or manifest.get("repo_revision"),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Explicit checkpoint sync failed for run {PRIVATE_RUN_ID!r}: {exc}. "
+                "No other run was selected."
+            ) from None
+    else:
+        manifest = load_active_checkpoint(
+            checkpoints_root=_CHECKPOINTS_ROOT,
+            run_id=PRIVATE_RUN_ID,
             repo_id=PRIVATE_CHECKPOINT_REPO,
-            repo_type="model",
-            filename=f"{prefix}/state.json",
-            token=HF_PRIVATE_CHECKPOINT_TOKEN or False,
-            force_download=True,
+            base_model_id=BASE_MODEL_ID,
         )
-        state = json.loads(pathlib.Path(state_path).read_text(encoding="utf-8"))
-        step = int(state.get("optimizer_step", 119114))
-        target_dir = _CHECKPOINTS_ROOT / f"checkpoint-{step}-adapter"
-        if not (target_dir / "adapter_model.safetensors").exists():
+    if manifest is not None:
+        adapter_path = _CHECKPOINTS_ROOT / manifest["adapter_path"]
+        parent_note = (
+            f", parent {manifest['parent_run_id']} step {manifest['parent_optimizer_step']:,}"
+            if manifest.get("parent_run_id") is not None else ""
+        )
+        display = (
+            f"OpenKhmer {manifest.get('training_phase') or 'checkpoint'} step "
+            f"{manifest['optimizer_step']:,}{parent_note} EMA LoRA"
+        )
+        if manifest.get("source_type", "hf") == "hf":
             logger.info(
-                f"Downloading private checkpoint step {step} from {PRIVATE_CHECKPOINT_REPO}..."
+                "Using activated OpenKhmer run %s step %s from pinned HF revision %s%s",
+                manifest["run_id"], manifest["optimizer_step"], manifest["repo_revision"], parent_note,
             )
-            dl_root = pathlib.Path(
-                snapshot_download(
-                    repo_id=PRIVATE_CHECKPOINT_REPO,
-                    repo_type="model",
-                    allow_patterns=[f"{prefix}/adapter/*", f"{prefix}/state.json"],
-                    token=HF_PRIVATE_CHECKPOINT_TOKEN or False,
-                    force_download=True,
-                )
+        else:
+            logger.info(
+                "Using activated OpenKhmer run %s step %s from %s%s",
+                manifest["run_id"], manifest["optimizer_step"],
+                manifest["source_identity"], parent_note,
             )
-            src_adapter = dl_root / prefix / "adapter"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for item in src_adapter.iterdir():
-                if item.is_file():
-                    shutil.copy2(item, target_dir / item.name)
-            shutil.copy2(dl_root / prefix / "state.json", target_dir / "state.json")
-        soup = _build_or_get_ema_soup_adapter()
-        if soup is not None:
-            return str(soup[0]), soup[1]
-        return (
-            str(target_dir),
-            f"OpenKhmer {step / 1000:.1f}k-step Vision+Language LoRA (checkpoint-{step})",
-        )
-    except Exception as exc:
-        logger.warning(f"Private checkpoint sync fallback: {exc}")
-        if (best_local / "adapter_model.safetensors").exists():
-            return (
-                str(best_local),
-                f"OpenKhmer Vision+Language LoRA ({best_local.name})",
-            )
-        return ("dvdphobia/Khmer-PaddleOCR-VL-LoRA", "dvdphobia/Khmer-PaddleOCR-VL-LoRA")
+        return str(adapter_path), display
+
+    raise RuntimeError(
+        f"No active checkpoint marker exists for configured run {PRIVATE_RUN_ID!r}. "
+        "Run `python sync_checkpoint.py` to fetch and activate that run, or set LORA_MODEL_ID explicitly."
+    )
 
 
-_RESOLVED_ADAPTER_PATH, _RESOLVED_DISPLAY_NAME = ensure_latest_private_adapter()
-LORA_MODEL_ID = os.environ.get("LORA_MODEL_ID", _RESOLVED_ADAPTER_PATH)
-LORA_DISPLAY_NAME = (
-    _RESOLVED_DISPLAY_NAME
-    if LORA_MODEL_ID == _RESOLVED_ADAPTER_PATH
-    else LORA_MODEL_ID
+def _resolve_default_adapter():
+    return ensure_latest_private_adapter()
+
+
+_RESOLVED_ADAPTER_PATH, _RESOLVED_DISPLAY_NAME = resolve_adapter_override(
+    os.environ.get("LORA_MODEL_ID"), _resolve_default_adapter,
 )
+LORA_MODEL_ID = _RESOLVED_ADAPTER_PATH
+LORA_DISPLAY_NAME = _RESOLVED_DISPLAY_NAME
 DOCLAYOUT_MODEL_ID = os.environ.get(
     "DOCLAYOUT_MODEL_ID", "PaddlePaddle/PP-DocLayoutV2_safetensors"
 )
@@ -244,9 +166,36 @@ LAYOUT_LABEL_TO_PROMPT = {
     "formula": "Formula Recognition:",
     "display_formula": "Formula Recognition:",
     "inline_formula": "Formula Recognition:",
+    "table": "Table Recognition:",
+    "chart": "Chart Recognition:",
 }
 
 FORMULA_LABELS = {"formula", "display_formula", "inline_formula"}
+# PP-DocLayoutV2 label set: running heads, feet and page numbers are not body text.
+LAYOUT_SKIP_LABELS = {"header", "footer", "number"}
+BASE_REGION_PROMPTS = {
+    LAYOUT_LABEL_TO_PROMPT[name]
+    for name in (FORMULA_LABELS | {"table", "chart"})
+    if name in LAYOUT_LABEL_TO_PROMPT
+}
+TASK_REGION_LABELS = {
+    "table": {"table"},
+    "formula": FORMULA_LABELS,
+    "chart": {"chart"},
+}
+# Block-level labels that the Khmer single-line LoRA cannot recognize well and
+# that need the base model's native table/chart/formula decoding.
+LAYOUT_BASE_LABELS = FORMULA_LABELS | {"table", "chart"}
+
+VALID_DET_MODES = {"smart_hybrid", "pp_doclayout_v2", "standard", "dense", "none"}
+
+# Controlled pre-scaling for DBNet. RapidOCR applies its max-side reduction
+# before its min-side floor, so a tall strip could otherwise be upscaled to
+# tens of megapixels. We pre-scale once and run the detector in "max" mode.
+DET_SCALE_TARGETS = {
+    "standard": {"floor": 1280, "cap": 2000, "max_pixels": 4_000_000},
+    "dense": {"floor": 1600, "cap": 2560, "max_pixels": 6_000_000},
+}
 
 
 def _contains_khmer(text: str) -> bool:
@@ -254,6 +203,7 @@ def _contains_khmer(text: str) -> bool:
 
 
 def _box_iou(b1: list[int], b2: list[int]) -> float:
+    """Standard Intersection over Union (IoU), not intersection over smaller area."""
     x1 = max(b1[0], b2[0])
     y1 = max(b1[1], b2[1])
     x2 = min(b1[2], b2[2])
@@ -263,7 +213,84 @@ def _box_iou(b1: list[int], b2: list[int]) -> float:
         return 0.0
     a1 = max(1, (b1[2] - b1[0]) * (b1[3] - b1[1]))
     a2 = max(1, (b2[2] - b2[0]) * (b2[3] - b2[1]))
-    return inter / float(min(a1, a2))
+    union = a1 + a2 - inter
+    if union <= 0:
+        return 0.0
+    return inter / float(union)
+
+
+def _box_area(box: list[int]) -> int:
+    return max(1, (box[2] - box[0]) * (box[3] - box[1]))
+
+
+def _box_intersection(b1: list[int], b2: list[int]) -> int:
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _box_containment(b1: list[int], b2: list[int]) -> float:
+    """Intersection over the smaller box's area (1.0 means fully contained)."""
+    inter = _box_intersection(b1, b2)
+    if inter <= 0:
+        return 0.0
+    return inter / float(min(_box_area(b1), _box_area(b2)))
+
+
+def _box_center(box: list[int]) -> tuple[float, float]:
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def _compute_det_scale(
+    width: int, height: int, floor: int, cap: int, max_pixels: int
+) -> float:
+    """Choose one bounded scale for a DBNet pass.
+
+    The min-side floor is only applied while it fits the long-side cap and the
+    pixel budget, so an extreme-aspect strip is never inflated to tens of MP.
+    """
+    if width <= 0 or height <= 0:
+        return 1.0
+    short_side = min(width, height)
+    long_side = max(width, height)
+    scale = 1.0
+    if short_side < floor:
+        scale = floor / float(short_side)
+    scale = min(scale, cap / float(long_side))
+    if width * height * scale * scale > max_pixels:
+        scale = (max_pixels / float(width * height)) ** 0.5
+    return max(scale, 0.02)
+
+
+def _full_image_box(width: int, height: int) -> dict:
+    return {
+        "id": 1,
+        "label": "full_image",
+        "score": 1.0,
+        "bbox": [0, 0, width, height],
+        "polygon": [[0, 0], [width, 0], [width, height], [0, height]],
+    }
+
+
+def _filter_boxes_for_task(
+    boxes: list[dict], task: str, image: Image.Image
+) -> list[dict]:
+    """Select the regions that make sense for a block-level task.
+
+    Table/Formula/Chart recognition should run on the matching layout block,
+    not on every DBNet text line. If no matching block exists, fall back to
+    the whole image so the task still receives a valid crop.
+    """
+    allowed = TASK_REGION_LABELS.get((task or "").lower())
+    if allowed is None:
+        return boxes
+    selected = [box for box in boxes if box.get("label") in allowed]
+    if selected:
+        return selected
+    width, height = image.size
+    return [_full_image_box(width, height)]
 
 
 def _detect_best_device() -> str:
@@ -309,52 +336,83 @@ class TextDetectorEngine:
             logger.info(f"Loaded {DOCLAYOUT_MODEL_ID} on {self._doclayout_device}")
 
     def _ensure_dbnet_initialized(self) -> None:
-        if self._det_standard is not None:
+        # Both engines are part of the published state; checking only the
+        # standard engine could expose a half-initialized dense engine.
+        if self._det_standard is not None and self._det_dense is not None:
             return
         with self._lock:
-            if self._det_standard is not None:
+            if self._det_standard is not None and self._det_dense is not None:
                 return
             from rapidocr_onnxruntime import RapidOCR
 
-            self._det_standard = RapidOCR(
+            # RapidOCR's UpdateParameters strips only the leading "det_" from
+            # constructor kwargs, so detector keys must keep that prefix
+            # (bare thresh/box_thresh land in Global and are ignored).
+            # The app pre-scales each page in _detect_dbnet. Running the inner
+            # detector with limit_type="max" prevents RapidOCR's uncapped
+            # min-side upscale (the global max_side_len was applied first, so
+            # it was never an outer cap for tall strips).
+            # max_side_len is a Global key, hence intentionally unprefixed.
+            standard = RapidOCR(
+                max_side_len=2000,
+                det_limit_side_len=2000,
+                det_limit_type="max",
+                det_thresh=0.24,
+                det_box_thresh=0.38,
+                det_unclip_ratio=1.32,
+                det_use_dilation=False,
+            )
+            # Dense uses a real 1600 px min floor. _detect_dbnet only selects
+            # it when its pre-scaled image already has a >=1600 px short side,
+            # so this floor can never inflate an extreme-aspect strip.
+            dense = RapidOCR(
+                max_side_len=2560,
                 det_limit_side_len=1600,
-                det_limit_type="max",
-                det_db_thresh=0.24,
-                det_db_box_thresh=0.38,
-                det_db_unclip_ratio=1.95,
+                det_limit_type="min",
+                det_thresh=0.20,
+                det_box_thresh=0.32,
+                det_unclip_ratio=1.28,
+                det_use_dilation=False,
             )
-            self._det_dense = RapidOCR(
-                det_limit_side_len=2048,
-                det_limit_type="max",
-                det_db_thresh=0.16,
-                det_db_box_thresh=0.26,
-                det_db_unclip_ratio=2.1,
-            )
+            # Publish only after both constructors succeed.
+            self._det_standard = standard
+            self._det_dense = dense
 
     @staticmethod
     def _group_into_horizontal_rows(boxes: list[dict]) -> list[list[dict]]:
-        """Groups boxes into horizontal rows sorted strictly top-to-bottom, and left-to-right within each row."""
-        boxes_sorted_y = sorted(
-            boxes, key=lambda b: (b["bbox"][1] + b["bbox"][3]) / 2.0
+        """Group boxes into rows using a stable median-height tolerance.
+
+        The previous running mean let one tall box raise the tolerance for
+        every later box and merge distinct lines. Rows are assigned to the
+        nearest representative center within a fixed tolerance instead.
+        """
+        if not boxes:
+            return []
+        heights = sorted(max(1, b["bbox"][3] - b["bbox"][1]) for b in boxes)
+        median_h = heights[len(heights) // 2]
+        tolerance = max(6.0, median_h * 0.55)
+
+        ordered = sorted(
+            boxes,
+            key=lambda b: ((b["bbox"][1] + b["bbox"][3]) / 2.0, b["bbox"][0]),
         )
         rows: list[list[dict]] = []
-        for b in boxes_sorted_y:
+        for b in ordered:
             cy = (b["bbox"][1] + b["bbox"][3]) / 2.0
-            bh = max(1, b["bbox"][3] - b["bbox"][1])
-            placed = False
+            best_row = None
+            best_delta = tolerance
             for row in rows:
                 row_cy = sum(
                     (r["bbox"][1] + r["bbox"][3]) / 2.0 for r in row
                 ) / len(row)
-                row_bh = sum(
-                    max(1, r["bbox"][3] - r["bbox"][1]) for r in row
-                ) / len(row)
-                if abs(cy - row_cy) < max(bh, row_bh) * 0.55:
-                    row.append(b)
-                    placed = True
-                    break
-            if not placed:
+                delta = abs(cy - row_cy)
+                if delta <= best_delta:
+                    best_row = row
+                    best_delta = delta
+            if best_row is None:
                 rows.append([b])
+            else:
+                best_row.append(b)
 
         rows.sort(
             key=lambda row: sum((r["bbox"][1] + r["bbox"][3]) / 2.0 for r in row)
@@ -364,15 +422,81 @@ class TextDetectorEngine:
             row.sort(key=lambda b: b["bbox"][0])
         return rows
 
+    @staticmethod
+    def _find_recurring_gap_columns(
+        rows: list[list[dict]], image_width: int
+    ) -> list[int]:
+        """Find x positions where a gap between boxes repeats across rows.
+
+        These are table-column boundaries or page gutters. Merging across
+        them is what turns cells into page-wide boxes.
+        """
+        row_count = sum(1 for row in rows if len(row) >= 2)
+        if row_count < 2:
+            return []
+        counts: dict[int, int] = {}
+        for row in rows:
+            seen: set[int] = set()
+            for prev, cur in zip(row, row[1:]):
+                gap = cur["bbox"][0] - prev["bbox"][2]
+                # Only real whitespace can be a column/gutter. Touching or
+                # overlapping same-line fragments must stay mergeable.
+                if gap < 1:
+                    continue
+                center = (prev["bbox"][2] + cur["bbox"][0]) / 2.0
+                if not (image_width * 0.02 <= center <= image_width * 0.98):
+                    continue
+                bucket = int(round(center / 12.0)) * 12
+                if bucket not in seen:
+                    seen.add(bucket)
+                    counts[bucket] = counts.get(bucket, 0) + 1
+        threshold = max(2, int(round(row_count * 0.30)))
+        return sorted(bucket for bucket, count in counts.items() if count >= threshold)
+
+    @staticmethod
+    def _gap_has_vertical_rule(
+        gray: Optional[np.ndarray],
+        x1: int,
+        x2: int,
+        y1: int,
+        y2: int,
+    ) -> bool:
+        """True when a near-vertical dark rule spans most of the gap band."""
+        if gray is None or x2 - x1 < 1:
+            return False
+        height, width = gray.shape[:2]
+        bx1 = max(0, min(width, int(x1)))
+        bx2 = max(0, min(width, int(x2)))
+        by1 = max(0, min(height, int(y1)))
+        by2 = max(0, min(height, int(y2)))
+        if bx2 - bx1 < 1 or by2 - by1 < 4:
+            return False
+        band = gray[by1:by2, bx1:bx2]
+        if band.size == 0:
+            return False
+        dark_fraction = (band < 180).mean(axis=0)
+        return bool((dark_fraction >= 0.70).any())
+
     @classmethod
     def _merge_horizontal_line_fragments(
-        cls, boxes: list[dict], image_width: int
+        cls,
+        boxes: list[dict],
+        image_width: int,
+        gray: Optional[np.ndarray] = None,
     ) -> list[dict]:
-        """Merges adjacent horizontal word/punctuation fragments within each horizontal row."""
+        """Merge same-line fragments without crossing gutters or table rules.
+
+        The old rule classified any short box as punctuation and allowed a
+        1.85x line-height gap, which merged adjacent table cells into
+        page-wide boxes. A gap may now bridge at most 0.55x the line height,
+        and never a gap position that repeats across rows or contains a
+        vertical rule.
+        """
         if len(boxes) <= 1:
             return boxes
 
         rows = cls._group_into_horizontal_rows(boxes)
+        separators = cls._find_recurring_gap_columns(rows, image_width)
         merged: list[dict] = []
 
         for row in rows:
@@ -389,23 +513,37 @@ class TextDetectorEngine:
                 bw = max(1, bx2 - bx1)
                 ph = max(1, py2 - py1)
                 bh = max(1, by2 - by1)
+                min_h = min(ph, bh)
 
                 y_overlap = min(py2, by2) - max(py1, by1)
-                same_line = y_overlap > 0.35 * min(ph, bh)
+                center_delta = abs((py1 + py2) / 2.0 - (by1 + by2) / 2.0)
+                same_line = (
+                    y_overlap > 0.45 * min_h and center_delta <= 0.30 * min_h
+                )
                 horiz_gap = bx1 - px2
-                is_small_punct = (pw <= ph * 1.45) or (bw <= bh * 1.45)
-                max_gap = max(ph, bh) * (1.85 if is_small_punct else 0.70)
-                min_gap = -min(pw, bw) if is_small_punct else -0.35 * min(ph, bh)
-                both_long_clauses = (pw > ph * 2.2) and (bw > bh * 2.2)
-                near_center_gutter = (
-                    both_long_clauses
-                    and (image_width * 0.42 <= px2 <= image_width * 0.58)
-                    and (image_width * 0.44 <= bx1 <= image_width * 0.60)
+                max_gap = 0.55 * max(ph, bh)
+                min_gap = -0.30 * min(pw, bw)
+
+                gap_lo = min(px2, bx1) - 2
+                gap_hi = max(px2, bx1) + 2
+                crosses_separator = any(
+                    gap_lo <= separator <= gap_hi for separator in separators
+                )
+                # Check the whole interval between the nearest edges, not
+                # just a positive gap: DB can hand back overlapping boxes
+                # that still straddle a cell border.
+                crosses_rule = cls._gap_has_vertical_rule(
+                    gray,
+                    min(px2, bx1),
+                    max(px2, bx1),
+                    min(py1, by1),
+                    max(py2, by2),
                 )
 
                 if (
                     same_line
-                    and not near_center_gutter
+                    and not crosses_separator
+                    and not crosses_rule
                     and min_gap <= horiz_gap <= max_gap
                     and (max(px2, bx2) - min(px1, bx1)) < image_width * 0.92
                 ):
@@ -426,20 +564,63 @@ class TextDetectorEngine:
 
         return merged
 
+    @staticmethod
+    def _contiguous_edge_run(
+        valid: np.ndarray, edge_index: int, step: int, edge_gap: int, max_run: int
+    ) -> Optional[tuple[int, int]]:
+        """Find an ink run starting near the box edge and walking outward.
+
+        Returns (near_offset, far_offset) measured in columns away from the
+        edge, or None when the first ink is too far, the run is a long rule,
+        or the run is not contiguous (at most a 1 px gap).
+        """
+        first = None
+        for offset in range(0, edge_gap + 1):
+            idx = edge_index + step * offset
+            if 0 <= idx < len(valid) and valid[idx]:
+                first = offset
+                break
+        if first is None:
+            return None
+
+        last = first
+        gap = 0
+        for offset in range(first + 1, len(valid)):
+            idx = edge_index + step * offset
+            if not (0 <= idx < len(valid)):
+                break
+            if valid[idx]:
+                last = offset
+                gap = 0
+            else:
+                gap += 1
+                if gap > 1:
+                    break
+        if last - first + 1 > max_run:
+            return None
+        return first, last
+
     @classmethod
     def _expand_line_punctuation_margins(
-        cls, boxes: list[dict], image: Image.Image
+        cls,
+        boxes: list[dict],
+        image: Image.Image,
+        gray: Optional[np.ndarray] = None,
     ) -> list[dict]:
-        """
-        Expands horizontal line boxes slightly left/right if isolated leading bullets (e.g. '$', '-')
-        or trailing Khmer punctuation (e.g. '។', 'ៗ') sit on the exact same baseline.
+        """Include a nearby isolated bullet or Khmer punctuation mark.
+
+        Expansion is limited to contiguous ink within 0.25x line height of
+        the box edge and at most 0.45x line height wide. This rejects long
+        rules, underlines and form lines, which previously pulled boxes out
+        by up to 46/56 px.
         """
         if not boxes:
             return boxes
         import cv2
 
         w, h = image.size
-        gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+        if gray is None:
+            gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
         rows = cls._group_into_horizontal_rows(boxes)
         out: list[dict] = []
 
@@ -451,36 +632,51 @@ class TextDetectorEngine:
                 y_bot = max(y_top + 1, min(h, by2 - int(bh * 0.14)))
                 band_h = max(1, y_bot - y_top)
 
-                # Safe left/right search limits that never cross into neighbor boxes
+                edge_gap = max(3, int(round(bh * 0.25)))
+                max_run = max(4, int(round(bh * 0.45)))
+                max_growth = max(6, int(round(bh * 0.50)))
+                search = edge_gap + max_run + 4
+
                 left_limit = (
-                    max(0, bx1 - min(42, int(bh * 1.25)))
+                    max(0, bx1 - search)
                     if i == 0
-                    else max(row[i - 1]["bbox"][2] + 4, bx1 - min(28, int(bh * 0.85)))
+                    else max(row[i - 1]["bbox"][2] + 3, bx1 - search)
                 )
                 right_limit = (
-                    min(w, bx2 + min(52, int(bh * 1.50)))
+                    min(w, bx2 + search)
                     if i == len(row) - 1
-                    else min(row[i + 1]["bbox"][0] - 4, bx2 + min(28, int(bh * 0.85)))
+                    else min(row[i + 1]["bbox"][0] - 3, bx2 + search)
                 )
 
                 if left_limit < bx1:
                     l_band = gray[y_top:y_bot, left_limit:bx1]
                     dark_cols = (l_band < 200).sum(axis=0)
-                    # Punctuation/bullet columns have ink (>=2px) but are not solid vertical border lines (<70% height)
-                    valid_cols = np.where(
-                        (dark_cols >= 2) & (dark_cols <= max(3, int(band_h * 0.70)))
-                    )[0]
-                    if len(valid_cols) >= 2:
-                        bx1 = max(0, left_limit + int(valid_cols[0]) - 4)
+                    valid = (dark_cols >= 2) & (
+                        dark_cols <= max(3, int(band_h * 0.70))
+                    )
+                    run = cls._contiguous_edge_run(
+                        valid, len(valid) - 1, -1, edge_gap, max_run
+                    )
+                    if run is not None:
+                        far = run[1]
+                        new_x1 = max(
+                            left_limit, bx1 - far - 3, bx1 - max_growth
+                        )
+                        bx1 = max(0, int(new_x1))
 
                 if right_limit > bx2:
                     r_band = gray[y_top:y_bot, bx2:right_limit]
                     dark_cols = (r_band < 200).sum(axis=0)
-                    valid_cols = np.where(
-                        (dark_cols >= 2) & (dark_cols <= max(3, int(band_h * 0.70)))
-                    )[0]
-                    if len(valid_cols) >= 2:
-                        bx2 = min(w, bx2 + int(valid_cols[-1]) + 5)
+                    valid = (dark_cols >= 2) & (
+                        dark_cols <= max(3, int(band_h * 0.70))
+                    )
+                    run = cls._contiguous_edge_run(valid, 0, 1, edge_gap, max_run)
+                    if run is not None:
+                        far = run[1]
+                        new_x2 = min(
+                            right_limit, bx2 + far + 4, bx2 + max_growth
+                        )
+                        bx2 = min(w, int(new_x2))
 
                 b["bbox"] = [bx1, by1, bx2, by2]
                 b["polygon"] = [
@@ -493,58 +689,319 @@ class TextDetectorEngine:
 
         return out
 
+    @staticmethod
+    def _deoverlap_vertical_boxes(
+        boxes: list[dict], labels: Optional[set[str]] = None
+    ) -> list[dict]:
+        """Clip sliver overlaps between adjacent text-line boxes.
+
+        Display boxes should not paint over each other. Crops keep their own
+        padded `crop_bbox`, so clipping the display bbox does not remove
+        Khmer ascenders or vowel signs from recognition.
+        """
+        if labels is None:
+            labels = {"text_line"}
+        candidates = [
+            b
+            for b in boxes
+            if b.get("label") in labels
+            and "bbox" in b
+            and (b["bbox"][2] > b["bbox"][0])
+            and (b["bbox"][3] > b["bbox"][1])
+        ]
+        for i, first in enumerate(candidates):
+            for second in candidates[i + 1 :]:
+                a = first["bbox"]
+                c = second["bbox"]
+                width_overlap = min(a[2], c[2]) - max(a[0], c[0])
+                if width_overlap < 0.35 * min(a[2] - a[0], c[2] - c[0]):
+                    continue
+                vertical_overlap = min(a[3], c[3]) - max(a[1], c[1])
+                if vertical_overlap <= 0:
+                    continue
+                ah = max(1, a[3] - a[1])
+                ch = max(1, c[3] - c[1])
+                # Only trim sliver overlaps. Large overlaps are duplicates and
+                # are handled by layout NMS; paragraph blocks are left alone.
+                if vertical_overlap > 0.85 * min(ah, ch):
+                    continue
+                if max(ah, ch) > 2.5 * min(ah, ch):
+                    continue
+                ac = (a[1] + a[3]) / 2.0
+                cc = (c[1] + c[3]) / 2.0
+                # Same-line fragments are merged elsewhere; never split them
+                # by treating their small center offset as a line boundary.
+                if abs(ac - cc) <= 0.30 * min(ah, ch):
+                    continue
+                mid = int(round((ac + cc) / 2.0))
+                if ac < cc:
+                    if mid - a[1] >= 4:
+                        a[3] = min(a[3], mid)
+                    if c[3] - mid >= 4:
+                        c[1] = max(c[1], mid)
+                else:
+                    if mid - c[1] >= 4:
+                        c[3] = min(c[3], mid)
+                    if a[3] - mid >= 4:
+                        a[1] = max(a[1], mid)
+                first["polygon"] = [
+                    [a[0], a[1]],
+                    [a[2], a[1]],
+                    [a[2], a[3]],
+                    [a[0], a[3]],
+                ]
+                second["polygon"] = [
+                    [c[0], c[1]],
+                    [c[2], c[1]],
+                    [c[2], c[3]],
+                    [c[0], c[3]],
+                ]
+        return boxes
+
     @classmethod
     def _sort_boxes_reading_order(
         cls,
         boxes: list[dict],
         image_width: int = 1000,
         allow_two_column: bool = False,
+        column_split: Optional[float] = None,
     ) -> list[dict]:
         if not boxes:
             return []
+
+        # Identity-based dedupe. The old column predicate could put the same
+        # centered dict in both column lists and emit it twice.
+        unique: list[dict] = []
+        seen_ids: set[int] = set()
+        for box in boxes:
+            if id(box) in seen_ids:
+                continue
+            seen_ids.add(id(box))
+            unique.append(box)
+        boxes = unique
 
         def _sort_single_column(col_boxes: list[dict]) -> list[dict]:
             rows = cls._group_into_horizontal_rows(col_boxes)
             return [b for row in rows for b in row]
 
-        if allow_two_column:
-            mid_x = image_width / 2.0
-            left_col = [b for b in boxes if b["bbox"][2] < mid_x * 1.04]
-            right_col = [b for b in boxes if b["bbox"][0] > mid_x * 0.96]
+        use_columns = allow_two_column or column_split is not None
+        if use_columns:
+            split_x = (
+                float(column_split)
+                if column_split is not None
+                else image_width / 2.0
+            )
+            margin = image_width * 0.04
             spanning = [
-                b for b in boxes if b not in left_col and b not in right_col
+                b
+                for b in boxes
+                if b["bbox"][0] < split_x - margin
+                and b["bbox"][2] > split_x + margin
+            ]
+            spanning_ids = {id(b) for b in spanning}
+            non_spanning = [b for b in boxes if id(b) not in spanning_ids]
+            left_col = [
+                b
+                for b in non_spanning
+                if (b["bbox"][0] + b["bbox"][2]) / 2.0 < split_x
+            ]
+            right_col = [
+                b
+                for b in non_spanning
+                if (b["bbox"][0] + b["bbox"][2]) / 2.0 >= split_x
             ]
             if (
                 len(left_col) >= 4
                 and len(right_col) >= 4
                 and len(spanning) <= max(3, int(0.2 * len(boxes)))
             ):
-                col_boxes_all = left_col + right_col
-                min_col_y = min(b["bbox"][1] for b in col_boxes_all)
-                max_col_y = max(b["bbox"][3] for b in col_boxes_all)
-                mid_col_y = (min_col_y + max_col_y) / 2.0
-                top_spanning = [
-                    b
-                    for b in spanning
-                    if (b["bbox"][1] + b["bbox"][3]) / 2.0 <= mid_col_y
-                ]
-                bottom_spanning = [
-                    b for b in spanning if b not in top_spanning
-                ]
-                ordered = (
-                    _sort_single_column(top_spanning)
-                    + _sort_single_column(left_col)
-                    + _sort_single_column(right_col)
-                    + _sort_single_column(bottom_spanning)
-                )
+                left_seq = _sort_single_column(left_col)
+                right_seq = _sort_single_column(right_col)
+                spanning_seq = _sort_single_column(spanning)
+                ordered = []
+                li = ri = 0
+                for span in spanning_seq:
+                    span_y = (span["bbox"][1] + span["bbox"][3]) / 2.0
+                    while (
+                        li < len(left_seq)
+                        and (left_seq[li]["bbox"][1] + left_seq[li]["bbox"][3]) / 2.0
+                        < span_y
+                    ):
+                        ordered.append(left_seq[li])
+                        li += 1
+                    while (
+                        ri < len(right_seq)
+                        and (right_seq[ri]["bbox"][1] + right_seq[ri]["bbox"][3]) / 2.0
+                        < span_y
+                    ):
+                        ordered.append(right_seq[ri])
+                        ri += 1
+                    ordered.append(span)
+                ordered.extend(left_seq[li:])
+                ordered.extend(right_seq[ri:])
             else:
                 ordered = _sort_single_column(boxes)
         else:
             ordered = _sort_single_column(boxes)
 
-        for idx, item in enumerate(ordered):
+        ordered_unique: list[dict] = []
+        emitted: set[int] = set()
+        for item in ordered:
+            if id(item) in emitted:
+                continue
+            emitted.add(id(item))
+            ordered_unique.append(item)
+
+        for idx, item in enumerate(ordered_unique):
             item["id"] = idx + 1
-        return ordered
+        return ordered_unique
+
+    @staticmethod
+    def _has_table_rules(
+        gray: Optional[np.ndarray], min_runs: int = 3
+    ) -> bool:
+        """Detect repeated full-width horizontal rules (tables/forms)."""
+        if gray is None:
+            return False
+        height, width = gray.shape[:2]
+        if height < 10 or width < 10:
+            return False
+        dark_fraction = (gray < 160).mean(axis=1)
+        runs = 0
+        in_run = False
+        for fraction in dark_fraction:
+            if fraction >= 0.85:
+                if not in_run:
+                    runs += 1
+                    in_run = True
+            else:
+                in_run = False
+        return runs >= min_runs
+
+    @staticmethod
+    def _detect_two_column_split(
+        boxes: list[dict],
+        image_width: int,
+        gray: Optional[np.ndarray] = None,
+    ) -> Optional[float]:
+        """Return a stable central gutter x, or None when the page is not a
+        two-column text layout.
+
+        Candidates come from gaps that recur across rows, so a full-width
+        title cannot hide the gutter. Forms/tables are rejected by horizontal
+        rules, width similarity and the multi-gutter check.
+        """
+        if len(boxes) < 8 or image_width <= 0:
+            return None
+        if TextDetectorEngine._has_table_rules(gray):
+            return None
+
+        rows = TextDetectorEngine._group_into_horizontal_rows(boxes)
+        separators = TextDetectorEngine._find_recurring_gap_columns(
+            rows, image_width
+        )
+        # A wobbling gutter can land in two adjacent 12 px buckets. Cluster
+        # nearby separators before the multi-gutter (3+ column) check.
+        clusters: list[list[int]] = []
+        for center in sorted(separators):
+            if clusters and center - clusters[-1][-1] <= 24:
+                clusters[-1].append(center)
+            else:
+                clusters.append([center])
+        candidates = [
+            sum(cluster) / len(cluster)
+            for cluster in clusters
+            if image_width * 0.25
+            <= sum(cluster) / len(cluster)
+            <= image_width * 0.75
+        ]
+        if not candidates:
+            return None
+
+        def gap_width(center: float) -> int:
+            left_edges = [
+                b["bbox"][2] for b in boxes if b["bbox"][2] <= center + 6
+            ]
+            right_edges = [
+                b["bbox"][0] for b in boxes if b["bbox"][0] >= center - 6
+            ]
+            if not left_edges or not right_edges:
+                return 0
+            return max(0, int(min(right_edges) - max(left_edges)))
+
+        widths = {center: gap_width(center) for center in candidates}
+        widest = max(widths.values())
+        if sum(1 for width in widths.values() if width >= 0.60 * widest) > 1:
+            # More than one equally wide gutter: a 3+ column grid or table.
+            return None
+
+        for center in sorted(candidates, key=lambda c: -widths[c]):
+            margin = max(8, int(round(image_width * 0.01)))
+            crossing = [
+                b
+                for b in boxes
+                if b["bbox"][0] < center - margin
+                and b["bbox"][2] > center + margin
+            ]
+            crossing_ids = {id(b) for b in crossing}
+            non_spanning = [b for b in boxes if id(b) not in crossing_ids]
+            left = [
+                b
+                for b in non_spanning
+                if (b["bbox"][0] + b["bbox"][2]) / 2.0 < center
+            ]
+            right = [
+                b
+                for b in non_spanning
+                if (b["bbox"][0] + b["bbox"][2]) / 2.0 >= center
+            ]
+            if (
+                len(left) < 6
+                or len(right) < 6
+                or len(crossing) > max(2, int(0.15 * len(boxes)))
+            ):
+                continue
+            left_widths = sorted(b["bbox"][2] - b["bbox"][0] for b in left)
+            right_widths = sorted(b["bbox"][2] - b["bbox"][0] for b in right)
+            left_median = left_widths[len(left_widths) // 2]
+            right_median = right_widths[len(right_widths) // 2]
+            narrower = min(left_median, right_median)
+            wider = max(left_median, right_median)
+            if narrower < image_width * 0.08:
+                continue
+            if narrower < 0.60 * wider:
+                # Label/value form or asymmetric grid, not two text columns.
+                continue
+            return center
+        return None
+
+    @staticmethod
+    def _nms_layout(candidates: list[dict]) -> list[dict]:
+        """Per-label NMS with containment suppression.
+
+        Standard IoU alone cannot remove a large text block that contains
+        many line boxes (containment 1.0, IoU ~0.05). Same-label containment
+        is therefore treated as duplication as well.
+        """
+        ordered = sorted(
+            candidates,
+            key=lambda c: (-c["score"], _box_area(c["bbox"])),
+        )
+        kept: list[dict] = []
+        for cand in ordered:
+            duplicate = False
+            for existing in kept:
+                if cand["label"] != existing["label"]:
+                    continue
+                if (
+                    _box_iou(cand["bbox"], existing["bbox"]) > 0.55
+                    or _box_containment(cand["bbox"], existing["bbox"]) > 0.85
+                ):
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(cand)
+        return kept
 
     def _detect_pp_doclayout_v2(
         self, image: Image.Image, threshold: float = 0.42
@@ -565,13 +1022,18 @@ class TextDetectorEngine:
                 logger.warning(
                     f"PP-DocLayoutV2 MPS fallback to CPU ({mps_exc})"
                 )
-                self._doclayout_device = "cpu"
-                self._doclayout_model = self._doclayout_model.to("cpu")
-                dev_inputs = {
-                    k: v.to("cpu") if isinstance(v, torch.Tensor) else v
-                    for k, v in inputs.items()
-                }
+                # Move and retry under the same lock as inference so another
+                # request cannot use a half-moved model or stale MPS inputs.
                 with self._lock, torch.inference_mode():
+                    if self._doclayout_device == "mps":
+                        self._doclayout_device = "cpu"
+                        self._doclayout_model = self._doclayout_model.to("cpu")
+                    dev_inputs = {
+                        k: v.to(self._doclayout_device)
+                        if isinstance(v, torch.Tensor)
+                        else v
+                        for k, v in inputs.items()
+                    }
                     outputs = self._doclayout_model(**dev_inputs)
             else:
                 raise
@@ -590,14 +1052,14 @@ class TextDetectorEngine:
             label_id = int(label_t.item())
             label_name = id2label.get(label_id, f"class_{label_id}")
 
-            if label_name in {"header_image", "footer_image"}:
+            if label_name in LAYOUT_SKIP_LABELS:
                 continue
 
             x1, y1, x2, y2 = [float(v) for v in box_t.tolist()]
-            bx1 = max(0, int(round(x1 - 4)))
-            by1 = max(0, int(round(y1 - 4)))
-            bx2 = min(w, int(round(x2 + 4)))
-            by2 = min(h, int(round(y2 + 4)))
+            bx1 = max(0, int(round(x1)))
+            by1 = max(0, int(round(y1)))
+            bx2 = min(w, int(round(x2)))
+            by2 = min(h, int(round(y2)))
 
             if (bx2 - bx1) < 10 or (by2 - by1) < 10:
                 continue
@@ -608,6 +1070,14 @@ class TextDetectorEngine:
                     "label": label_name,
                     "score": round(score, 3),
                     "bbox": [bx1, by1, bx2, by2],
+                    # Crops keep 2 px of context; display geometry stays tight
+                    # so adjacent blocks do not overlap from padding.
+                    "crop_bbox": [
+                        max(0, bx1 - 2),
+                        max(0, by1 - 2),
+                        min(w, bx2 + 2),
+                        min(h, by2 + 2),
+                    ],
                     "polygon": [
                         [bx1, by1],
                         [bx2, by1],
@@ -617,17 +1087,40 @@ class TextDetectorEngine:
                 }
             )
 
-        # Apply Non-Maximum Suppression (NMS) so duplicate overlapping boxes are removed
-        candidates.sort(key=lambda c: c["score"], reverse=True)
-        kept: list[dict] = []
-        for cand in candidates:
-            if any(_box_iou(cand["bbox"], k["bbox"]) > 0.55 for k in kept):
-                continue
-            kept.append(cand)
-
+        kept = self._nms_layout(candidates)
+        kept = self._suppress_text_inside_blocks(kept)
+        # The model can emit line boxes that share a few pixels; trim the
+        # display sliver while the crop_bbox keeps the context.
+        kept = self._deoverlap_vertical_boxes(kept, labels={"text", "content"})
         return self._sort_boxes_reading_order(
             kept, image_width=w, allow_two_column=True
         )
+
+    @staticmethod
+    def _suppress_text_inside_blocks(boxes: list[dict]) -> list[dict]:
+        """Drop text blocks fully contained in a table/chart block.
+
+        Same-label NMS cannot remove these because the labels differ; without
+        this, the Layout tab paints table text and table-cell lines on top of
+        each other.
+        """
+        containers = [
+            b for b in boxes if b["label"] in {"table", "chart"}
+        ]
+        if not containers:
+            return boxes
+        return [
+            b
+            for b in boxes
+            if not (
+                b["label"] in {"text", "content"}
+                and any(
+                    _box_containment(b["bbox"], c["bbox"]) > 0.85
+                    and _box_area(c["bbox"]) > _box_area(b["bbox"])
+                    for c in containers
+                )
+            )
+        ]
 
     def _detect_dbnet(
         self, image: Image.Image, mode: str = "standard", merge_fragments: bool = False
@@ -639,27 +1132,45 @@ class TextDetectorEngine:
         padded_img = ImageOps.expand(image, border=border_pad, fill=(255, 255, 255))
         pw, ph = padded_img.size
 
-        scale = 1.0
+        target = DET_SCALE_TARGETS["dense" if mode == "dense" else "standard"]
+        scale = _compute_det_scale(
+            pw,
+            ph,
+            target["floor"],
+            target["cap"],
+            target["max_pixels"],
+        )
         work_img = padded_img
-        min_dim = min(w, h)
-        if mode == "dense" and max(w, h) < 1600:
-            scale = 2.0
+        if abs(scale - 1.0) > 1e-3:
             work_img = padded_img.resize(
-                (int(pw * scale), int(ph * scale)), Image.Resampling.LANCZOS
-            )
-        elif min_dim < 600:
-            scale = 1.5
-            work_img = padded_img.resize(
-                (int(pw * scale), int(ph * scale)), Image.Resampling.LANCZOS
+                (max(1, int(round(pw * scale))), max(1, int(round(ph * scale)))),
+                Image.Resampling.LANCZOS,
             )
 
         img_np = np.array(work_img)
-        detector = self._det_dense if mode == "dense" else self._det_standard
+        detector = self._det_standard
+        if mode == "dense" and min(work_img.size) >= 1600:
+            # Dense's min-side floor is only safe when pre-scaling already
+            # reached it; otherwise the floor would upscale a strip without
+            # bound. Fall back to the bounded standard detector.
+            detector = self._det_dense
 
         with self._lock:
             raw_boxes, _ = detector(img_np, use_det=True, use_cls=False, use_rec=False)
 
         parsed_boxes: list[dict] = []
+
+        def _crop_box(raw_box: list[int]) -> list[int]:
+            box_h = max(1, raw_box[3] - raw_box[1])
+            cx = max(2, int(round(box_h * 0.04)))
+            cy = max(3, int(round(box_h * 0.08)))
+            return [
+                max(0, raw_box[0] - cx),
+                max(0, raw_box[1] - cy),
+                min(w, raw_box[2] + cx),
+                min(h, raw_box[3] + cy),
+            ]
+
         if raw_boxes is not None and len(raw_boxes) > 0:
             for poly in raw_boxes:
                 pts = [
@@ -677,12 +1188,16 @@ class TextDetectorEngine:
                 if bw < 5 or bh < 5:
                     continue
 
-                pad_x = max(4, int(bh * 0.20))
-                pad_y = max(4, int(bh * 0.25))
-                bx1 = max(0, int(round(x1 - pad_x)))
-                by1 = max(0, int(round(y1 - pad_y)))
-                bx2 = min(w, int(round(x2 + pad_x)))
-                by2 = min(h, int(round(y2 + pad_y)))
+                # Display geometry stays tight. The padded box is kept
+                # separately for recognition so Khmer ascenders and vowel
+                # signs are not clipped and widening the display box is not
+                # needed to protect the crop.
+                bx1 = max(0, int(round(x1)))
+                by1 = max(0, int(round(y1)))
+                bx2 = min(w, int(round(x2)))
+                by2 = min(h, int(round(y2)))
+                if bx2 - bx1 < 5 or by2 - by1 < 5:
+                    continue
 
                 parsed_boxes.append(
                     {
@@ -690,62 +1205,123 @@ class TextDetectorEngine:
                         "label": "text_line",
                         "score": 1.0,
                         "bbox": [bx1, by1, bx2, by2],
+                        "crop_bbox": _crop_box([bx1, by1, bx2, by2]),
                         "polygon": [[round(p[0], 1), round(p[1], 1)] for p in pts],
                     }
                 )
 
+        # One grayscale copy shared by the merge rule check, the
+        # punctuation-band scan, and the table/form guard for column detection.
+        gray = np.array(image.convert("L"))
         if merge_fragments:
-            parsed_boxes = self._merge_horizontal_line_fragments(parsed_boxes, w)
-            parsed_boxes = self._expand_line_punctuation_margins(parsed_boxes, image)
+            parsed_boxes = self._merge_horizontal_line_fragments(
+                parsed_boxes, w, gray=gray
+            )
+            parsed_boxes = self._expand_line_punctuation_margins(
+                parsed_boxes, image, gray=gray
+            )
 
+        # Merge/expansion change the display bbox; refresh the recognition
+        # crop from the final geometry, then trim display slivers only.
+        for item in parsed_boxes:
+            item["crop_bbox"] = _crop_box(item["bbox"])
+        parsed_boxes = self._deoverlap_vertical_boxes(parsed_boxes)
+
+        split = self._detect_two_column_split(parsed_boxes, w, gray=gray)
         return self._sort_boxes_reading_order(
-            parsed_boxes, image_width=w, allow_two_column=False
+            parsed_boxes, image_width=w, column_split=split
         )
 
-    def detect(self, image: Image.Image, mode: str = "smart_hybrid") -> dict:
+    def detect(
+        self,
+        image: Image.Image,
+        mode: str = "smart_hybrid",
+        task: str = "ocr",
+    ) -> dict:
         t0 = time.perf_counter()
         w, h = image.size
+        task_lower = (task or "ocr").lower()
 
         if mode == "none":
             return {
                 "mode": "none",
                 "elapsed_ms": 0.1,
                 "image_size": {"width": w, "height": h},
-                "boxes": [
-                    {
-                        "id": 1,
-                        "label": "full_image",
-                        "score": 1.0,
-                        "bbox": [0, 0, w, h],
-                        "polygon": [[0, 0], [w, 0], [w, h], [0, h]],
-                    }
-                ],
+                "boxes": [_full_image_box(w, h)],
             }
 
         ordered_boxes: list[dict] = []
 
         if mode == "smart_hybrid":
-            # Run both DBNet and PP-DocLayoutV2 to pick the optimal segmentation:
-            # - Academic / Formula document: use deduplicated PP-DocLayoutV2 blocks (paragraphs + formulas)
-            # - Table, Org Chart, or Handwritten page: use merged DBNet single-line boxes
-            layout_boxes = self._detect_pp_doclayout_v2(image, threshold=0.38)
-            dbnet_boxes = self._detect_dbnet(image, mode="standard", merge_fragments=True)
-
-            formula_boxes = [
-                b
-                for b in layout_boxes
-                if b["label"] in FORMULA_LABELS
+            # Text is always recognized from DBNet line boxes because the
+            # Khmer LoRA is trained on single-line crops. Layout blocks are
+            # used only where a block-level prompt is correct: formulas,
+            # tables and charts. This removes the old "one formula flips the
+            # whole page to paragraph crops" failure.
+            layout_boxes = self._detect_pp_doclayout_v2(image, threshold=0.42)
+            dbnet_boxes = self._detect_dbnet(
+                image, mode="standard", merge_fragments=True
+            )
+            # Formulas are safe to add to an OCR page. Table/chart blocks are
+            # only included when that task is selected: the layout model can
+            # mislabel a text-heavy page as one full-page table, which would
+            # otherwise replace every line region with a table crop.
+            block_labels = set(FORMULA_LABELS)
+            if task_lower in {"table", "chart"}:
+                block_labels.add(task_lower)
+            block_boxes = [
+                b for b in layout_boxes if b["label"] in block_labels
             ]
 
-            if formula_boxes and len(layout_boxes) >= 4:
-                # Academic / Formula document: use deduplicated layout blocks (text + formulas)
-                ordered_boxes = [
-                    b for b in layout_boxes if b["label"] != "image"
+            if block_boxes:
+                def _center_in_block(box: dict, block: dict) -> bool:
+                    cx, cy = _box_center(box["bbox"])
+                    bb = block["bbox"]
+                    return bb[0] <= cx <= bb[2] and bb[1] <= cy <= bb[3]
+
+                def _line_is_block_content(box: dict, block: dict) -> bool:
+                    # Table/chart blocks own everything whose center falls
+                    # inside them. A formula only replaces a line when the
+                    # line is genuinely the formula crop; an inline formula
+                    # must not delete the surrounding text line.
+                    if block["label"] in FORMULA_LABELS:
+                        # Fraction of the LINE covered by the formula block.
+                        # Containment over the smaller area would also be 1.0
+                        # for a small inline formula.
+                        return (
+                            _box_intersection(box["bbox"], block["bbox"])
+                            / float(_box_area(box["bbox"]))
+                        ) > 0.75
+                    return _center_in_block(box, block)
+
+                text_boxes = [
+                    b
+                    for b in dbnet_boxes
+                    if not any(
+                        _line_is_block_content(b, block) for block in block_boxes
+                    )
                 ]
+                blocks_to_add: list[dict] = []
+                for block in block_boxes:
+                    if block["label"] in FORMULA_LABELS and any(
+                        _box_containment(block["bbox"], line["bbox"]) > 0.85
+                        and _box_area(line["bbox"]) > 1.5 * _box_area(block["bbox"])
+                        for line in text_boxes
+                    ):
+                        # Inline formula: the line crop already contains it.
+                        continue
+                    blocks_to_add.append(block)
+                combined = text_boxes + blocks_to_add
+                split = self._detect_two_column_split(combined, w)
+                ordered_boxes = self._sort_boxes_reading_order(
+                    combined, image_width=w, column_split=split
+                )
             else:
-                # Document, Table, Org Chart, or Handwritten page: use merged DBNet lines
-                # because the Khmer LoRA model is trained on single-line crops!
                 ordered_boxes = dbnet_boxes
+                if not ordered_boxes:
+                    ordered_boxes = [
+                        b for b in layout_boxes if b["label"] != "image"
+                    ]
         elif mode == "pp_doclayout_v2":
             ordered_boxes = [
                 b
@@ -753,22 +1329,26 @@ class TextDetectorEngine:
                 if b["label"] != "image"
             ]
             if not ordered_boxes:
-                ordered_boxes = self._detect_dbnet(image, mode="standard", merge_fragments=True)
+                ordered_boxes = self._detect_dbnet(
+                    image, mode="standard", merge_fragments=True
+                )
+        elif mode == "dense":
+            ordered_boxes = self._detect_dbnet(
+                image, mode="dense", merge_fragments=True
+            )
         elif mode == "standard":
-            ordered_boxes = self._detect_dbnet(image, mode="standard", merge_fragments=True)
+            ordered_boxes = self._detect_dbnet(
+                image, mode="standard", merge_fragments=True
+            )
         else:
-            ordered_boxes = self._detect_dbnet(image, mode=mode, merge_fragments=False)
+            # Unknown modes are rejected at the API boundary; use standard
+            # geometry rather than silently returning unmerged fragments.
+            ordered_boxes = self._detect_dbnet(
+                image, mode="standard", merge_fragments=True
+            )
 
         if not ordered_boxes:
-            ordered_boxes = [
-                {
-                    "id": 1,
-                    "label": "full_image",
-                    "score": 1.0,
-                    "bbox": [0, 0, w, h],
-                    "polygon": [[0, 0], [w, 0], [w, h], [0, h]],
-                }
-            ]
+            ordered_boxes = [_full_image_box(w, h)]
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         return {
@@ -825,6 +1405,40 @@ class TextDetectorEngine:
 
 
 detector_engine = TextDetectorEngine()
+
+# Preview and OCR send the same bytes. Cache the detection result so one
+# click does not run the detector twice (and compare mode does not run it
+# twice more). The cache is process-local and bounded.
+_DETECTION_CACHE: "OrderedDict[tuple[str, str], dict]" = OrderedDict()
+_DETECTION_CACHE_LOCK = threading.Lock()
+_DETECTION_CACHE_MAX = 8
+
+
+def _cached_detect(
+    image: Image.Image,
+    raw_bytes: Optional[bytes],
+    mode: str,
+    task: str = "ocr",
+) -> dict:
+    if raw_bytes:
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+    else:
+        digest = hashlib.sha256(image.tobytes()).hexdigest()
+    key = (digest, mode, (task or "ocr").lower())
+    with _DETECTION_CACHE_LOCK:
+        cached = _DETECTION_CACHE.get(key)
+        if cached is not None:
+            _DETECTION_CACHE.move_to_end(key)
+            result = dict(cached)
+            result["cached"] = True
+            return result
+    result = detector_engine.detect(image, mode=mode, task=task)
+    with _DETECTION_CACHE_LOCK:
+        _DETECTION_CACHE[key] = result
+        _DETECTION_CACHE.move_to_end(key)
+        while len(_DETECTION_CACHE) > _DETECTION_CACHE_MAX:
+            _DETECTION_CACHE.popitem(last=False)
+    return result
 
 
 class ModelManager:
@@ -1037,6 +1651,15 @@ class ModelManager:
         )[0]
         cleaned_text = self.clean_output_text(decoded, prompt_text)
 
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        last_token = (
+            int(generated_ids[0, -1].item()) if num_tokens > 0 else None
+        )
+        truncated = num_tokens >= max_new_tokens and (
+            eos_token_id is None or last_token != eos_token_id
+        )
+
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         tokens_per_sec = (
             round(num_tokens / (elapsed_ms / 1000.0), 1) if elapsed_ms > 0 else 0.0
@@ -1048,10 +1671,159 @@ class ModelManager:
             "use_lora": use_lora,
             "model_id": LORA_MODEL_ID if use_lora else BASE_MODEL_ID,
             "elapsed_ms": elapsed_ms,
+            "truncated": bool(truncated),
             "tokens": num_tokens,
             "tokens_per_sec": tokens_per_sec,
             "image_size": {"width": image.width, "height": image.height},
         }
+
+    def _prepare_region(
+        self,
+        image: Image.Image,
+        box: dict,
+        prompt_text: str,
+        max_new_tokens: int,
+    ) -> tuple[Image.Image, str, str, str, int]:
+        box_label = box.get("label", "text_line")
+        crop_img, thumb_b64 = detector_engine.crop_and_enhance(
+            image,
+            box.get("crop_bbox") or box["bbox"],
+            box_label=box_label,
+        )
+        box_prompt = (
+            LAYOUT_LABEL_TO_PROMPT.get(box_label, prompt_text)
+            if prompt_text == "OCR:"
+            else prompt_text
+        )
+        if box_label == "text_line":
+            budget = max(32, min(int(max_new_tokens), 384))
+        else:
+            budget = max(128, min(int(max_new_tokens), 2048))
+        return crop_img, thumb_b64, box_label, box_prompt, budget
+
+    def _generate_region(
+        self,
+        crop_img: Image.Image,
+        box_label: str,
+        box_prompt: str,
+        budget: int,
+        use_lora: bool,
+    ) -> dict:
+        total_tokens = 0
+        total_ms = 0.0
+        used_lora = False
+        try:
+            if box_label in LAYOUT_BASE_LABELS or box_prompt in BASE_REGION_PROMPTS:
+                # Formula/table/chart blocks (including a task-level
+                # full-image fallback) use the base model's native decoders;
+                # the Khmer single-line adapter is not appropriate.
+                res = self.predict(
+                    image=crop_img,
+                    prompt_text=box_prompt,
+                    max_new_tokens=budget,
+                    use_lora=False,
+                )
+            else:
+                used_lora = bool(use_lora)
+                res = self.predict(
+                    image=crop_img,
+                    prompt_text=box_prompt,
+                    max_new_tokens=budget,
+                    use_lora=used_lora,
+                )
+            total_tokens += int(res["tokens"])
+            total_ms += float(res["elapsed_ms"])
+            truncated = bool(
+                res.get("truncated", int(res["tokens"]) >= budget)
+            )
+
+            # Per-region fallback, never a page-wide latch. A block that is
+            # non-Khmer or hit the token cap is retried on the base model.
+            if used_lora and box_label != "text_line" and (
+                not _contains_khmer(res["text"]) or truncated
+            ):
+                try:
+                    base_res = self.predict(
+                        image=crop_img,
+                        prompt_text=box_prompt,
+                        max_new_tokens=budget,
+                        use_lora=False,
+                    )
+                except Exception as fallback_exc:
+                    # Keep the successful LoRA text instead of discarding it.
+                    logger.warning(
+                        f"Base fallback failed ({box_label}): {fallback_exc}"
+                    )
+                    base_res = None
+                if base_res is not None:
+                    total_tokens += int(base_res["tokens"])
+                    total_ms += float(base_res["elapsed_ms"])
+                    if (
+                        _contains_khmer(base_res["text"])
+                        or len(base_res["text"].strip())
+                        > len(res["text"].strip())
+                    ):
+                        res = base_res
+                        used_lora = False
+                        truncated = bool(
+                            base_res.get(
+                                "truncated",
+                                int(base_res["tokens"]) >= budget,
+                            )
+                        )
+
+            return {
+                "text": res["text"].strip(),
+                "tokens": total_tokens,
+                "elapsed_ms": round(total_ms, 1),
+                "used_lora": used_lora,
+                "truncated": bool(truncated),
+                "error": None,
+            }
+        except Exception as exc:
+            logger.warning(f"Region OCR error ({box_label}): {exc}")
+            return {
+                "text": "",
+                "tokens": total_tokens,
+                "elapsed_ms": round(total_ms, 1),
+                "used_lora": used_lora,
+                "truncated": False,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _same_row_as_prev(prev_box: Optional[dict], box: dict) -> bool:
+        if not prev_box:
+            return False
+        prev_b = prev_box["bbox"]
+        cur_b = box["bbox"]
+        prev_cy = (prev_b[1] + prev_b[3]) / 2.0
+        cur_cy = (cur_b[1] + cur_b[3]) / 2.0
+        prev_bh = max(1, prev_b[3] - prev_b[1])
+        cur_bh = max(1, cur_b[3] - cur_b[1])
+        gap = cur_b[0] - prev_b[2]
+        max_gap = max(40.0, 0.8 * min(prev_bh, cur_bh))
+        return (
+            abs(cur_cy - prev_cy) < max(prev_bh, cur_bh) * 0.55
+            and -25 <= gap <= max_gap
+        )
+
+    @staticmethod
+    def _append_text_line(
+        lines: list[str],
+        regions: list[dict],
+        text: str,
+        same_row: bool,
+    ) -> None:
+        if not text:
+            return
+        # Only merge into the previous output line when the immediately
+        # previous box actually produced text. Otherwise an empty region
+        # could splice a later row into an earlier one.
+        if same_row and lines and regions and regions[-1].get("text"):
+            lines[-1] = f"{lines[-1]}    {text}"
+        else:
+            lines.append(text)
 
     def stream_regions_predict(
         self,
@@ -1060,24 +1832,60 @@ class ModelManager:
         max_new_tokens: int = 512,
         use_lora: bool = True,
         det_mode: str = "smart_hybrid",
+        det_result: Optional[dict] = None,
+        task: str = "ocr",
     ):
-        if self.status != "ready" or self.model is None:
-            raise RuntimeError(f"Model is not ready (status: {self.status_message})")
-
         t0 = time.perf_counter()
-        det_result = detector_engine.detect(image, mode=det_mode)
-        boxes = det_result["boxes"]
+        try:
+            if self.status != "ready" or self.model is None:
+                raise RuntimeError(
+                    f"Model is not ready (status: {self.status_message})"
+                )
+            if det_result is None:
+                det_result = detector_engine.detect(image, mode=det_mode)
+        except Exception as exc:
+            logger.exception("Detection failed before region streaming")
+            error_payload = json.dumps(
+                {"type": "error", "error": str(exc)}, ensure_ascii=False
+            )
+            yield f"data: {error_payload}\n\n"
+            return
+
+        boxes = _filter_boxes_for_task(det_result["boxes"], task, image)
 
         det_event = json.dumps(
             {
                 "type": "detections",
                 "boxes": boxes,
                 "det_elapsed_ms": det_result["elapsed_ms"],
+                "det_cached": bool(det_result.get("cached", False)),
                 "det_mode": det_mode,
             },
             ensure_ascii=False,
         )
         yield f"data: {det_event}\n\n"
+
+        if not boxes:
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            empty_payload = json.dumps(
+                {
+                    "type": "done",
+                    "text": "",
+                    "regions": [],
+                    "prompt": prompt_text,
+                    "use_lora": use_lora,
+                    "model_id": LORA_MODEL_ID if use_lora else BASE_MODEL_ID,
+                    "elapsed_ms": elapsed_ms,
+                    "det_elapsed_ms": det_result["elapsed_ms"],
+                    "det_cached": bool(det_result.get("cached", False)),
+                    "tokens": 0,
+                    "tokens_per_sec": 0.0,
+                    "image_size": {"width": image.width, "height": image.height},
+                },
+                ensure_ascii=False,
+            )
+            yield f"data: {empty_payload}\n\n"
+            return
 
         if det_mode == "none" or (
             len(boxes) == 1
@@ -1089,8 +1897,11 @@ class ModelManager:
             )
             yield f"data: {start_ev}\n\n"
 
+            full_use_lora = (
+                False if prompt_text in BASE_REGION_PROMPTS else use_lora
+            )
             for chunk in self.stream_single_image(
-                image, prompt_text, max_new_tokens, use_lora, boxes
+                image, prompt_text, max_new_tokens, full_use_lora, boxes
             ):
                 yield chunk
             return
@@ -1099,27 +1910,41 @@ class ModelManager:
         recognized_lines: list[str] = []
         region_results: list[dict] = []
         total_tokens = 0
-        per_box_max_tokens = min(max_new_tokens, 384)
-        page_has_khmer: Optional[bool] = None
+        any_lora = False
 
         for idx, box in enumerate(boxes, start=1):
-            box_label = box.get("label", "text_line")
-            crop_img, thumb_b64 = detector_engine.crop_and_enhance(
-                image, box["bbox"], box_label=box_label
+            same_row_as_prev = (
+                idx > 1 and self._same_row_as_prev(boxes[idx - 2], box)
             )
-            box_prompt = (
-                LAYOUT_LABEL_TO_PROMPT.get(box_label, prompt_text)
-                if prompt_text == "OCR:"
-                else prompt_text
-            )
-            # For LaTeX math formulas, route to base PaddleOCR-VL (which has native LaTeX formula decoding)
-            box_use_lora = (
-                False
-                if box_label in FORMULA_LABELS
-                else use_lora
-            )
-            if box_use_lora and box_label != "text_line" and page_has_khmer is False:
-                box_use_lora = False
+            try:
+                (
+                    crop_img,
+                    thumb_b64,
+                    box_label,
+                    box_prompt,
+                    budget,
+                ) = self._prepare_region(
+                    image, box, prompt_text, max_new_tokens
+                )
+            except Exception as exc:
+                logger.warning(f"Region preparation failed: {exc}")
+                region_item = {
+                    "id": box["id"],
+                    "label": box.get("label", "text_line"),
+                    "score": box.get("score", 1.0),
+                    "bbox": box["bbox"],
+                    "polygon": box["polygon"],
+                    "text": "",
+                    "same_row_as_prev": same_row_as_prev,
+                    "elapsed_ms": 0.0,
+                    "thumb": None,
+                    "truncated": False,
+                    "error": str(exc),
+                    "adapter": "none",
+                }
+                region_results.append(region_item)
+                yield f"data: {json.dumps({'type': 'region_done', 'index': idx, 'total': total_boxes, 'region': region_item}, ensure_ascii=False)}\n\n"
+                continue
 
             start_payload = json.dumps(
                 {
@@ -1133,58 +1958,18 @@ class ModelManager:
             )
             yield f"data: {start_payload}\n\n"
 
-            try:
-                res = self.predict(
-                    image=crop_img,
-                    prompt_text=box_prompt,
-                    max_new_tokens=per_box_max_tokens,
-                    use_lora=box_use_lora,
-                )
-                line_text = res["text"].strip()
-                total_tokens += res["tokens"]
-                box_elapsed = res["elapsed_ms"]
+            res = self._generate_region(
+                crop_img, box_label, box_prompt, budget, use_lora
+            )
+            total_tokens += res["tokens"]
+            any_lora = any_lora or res["used_lora"]
 
-                # If this is a multi-line layout block (from PP-DocLayoutV2) and the single-line LoRA
-                # produced zero Khmer characters, switch to Base PaddleOCR-VL so multi-line English/LaTeX
-                # paragraphs are read completely without single-line truncation.
-                if box_use_lora and box_label != "text_line":
-                    if _contains_khmer(line_text):
-                        page_has_khmer = True
-                    else:
-                        page_has_khmer = False
-                        res_base = self.predict(
-                            image=crop_img,
-                            prompt_text=box_prompt,
-                            max_new_tokens=per_box_max_tokens,
-                            use_lora=False,
-                        )
-                        line_text = res_base["text"].strip()
-                        total_tokens += res_base["tokens"]
-                        box_elapsed = round(box_elapsed + res_base["elapsed_ms"], 1)
-            except Exception as exc:
-                logger.warning(f"Region #{idx} OCR error: {exc}")
-                line_text = ""
-                box_elapsed = 0.0
-
-            same_row_as_prev = False
-            if idx > 1:
-                prev_b = boxes[idx - 2]["bbox"]
-                cur_b = box["bbox"]
-                prev_cy = (prev_b[1] + prev_b[3]) / 2.0
-                cur_cy = (cur_b[1] + cur_b[3]) / 2.0
-                prev_bh = max(1, prev_b[3] - prev_b[1])
-                cur_bh = max(1, cur_b[3] - cur_b[1])
-                if (
-                    abs(cur_cy - prev_cy) < max(prev_bh, cur_bh) * 0.55
-                    and cur_b[0] >= prev_b[2] - 25
-                ):
-                    same_row_as_prev = True
-
-            if line_text:
-                if same_row_as_prev and recognized_lines:
-                    recognized_lines[-1] = f"{recognized_lines[-1]}    {line_text}"
-                else:
-                    recognized_lines.append(line_text)
+            self._append_text_line(
+                recognized_lines,
+                region_results,
+                res["text"],
+                same_row_as_prev,
+            )
 
             region_item = {
                 "id": box["id"],
@@ -1192,10 +1977,13 @@ class ModelManager:
                 "score": box.get("score", 1.0),
                 "bbox": box["bbox"],
                 "polygon": box["polygon"],
-                "text": line_text,
+                "text": res["text"],
                 "same_row_as_prev": same_row_as_prev,
-                "elapsed_ms": box_elapsed,
+                "elapsed_ms": res["elapsed_ms"],
                 "thumb": thumb_b64,
+                "truncated": res["truncated"],
+                "error": res["error"],
+                "adapter": "lora" if res["used_lora"] else "base",
             }
             region_results.append(region_item)
 
@@ -1222,9 +2010,15 @@ class ModelManager:
                 "text": full_text,
                 "regions": region_results,
                 "prompt": prompt_text,
-                "use_lora": use_lora,
-                "model_id": LORA_MODEL_ID if use_lora else BASE_MODEL_ID,
+                "use_lora": any_lora if region_results else use_lora,
+                "model_id": (
+                    LORA_MODEL_ID
+                    if (any_lora if region_results else use_lora)
+                    else BASE_MODEL_ID
+                ),
                 "elapsed_ms": elapsed_ms,
+                "det_elapsed_ms": det_result["elapsed_ms"],
+                "det_cached": bool(det_result.get("cached", False)),
                 "tokens": total_tokens,
                 "tokens_per_sec": tokens_per_sec,
                 "image_size": {"width": image.width, "height": image.height},
@@ -1244,7 +2038,12 @@ class ModelManager:
         from transformers import TextIteratorStreamer
 
         t0 = time.perf_counter()
-        inputs = self.prepare_inputs(image, prompt_text)
+        try:
+            inputs = self.prepare_inputs(image, prompt_text)
+        except Exception as exc:
+            logger.warning(f"Full-image input preparation failed: {exc}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)}, ensure_ascii=False)}\n\n"
+            return
 
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         streamer = TextIteratorStreamer(
@@ -1328,7 +2127,11 @@ class ModelManager:
             "bbox": box_item["bbox"],
             "polygon": box_item["polygon"],
             "text": full_text,
+            "same_row_as_prev": False,
             "elapsed_ms": elapsed_ms,
+            "truncated": chunk_count >= max_new_tokens,
+            "error": generation_error[0] if generation_error else None,
+            "adapter": "lora" if use_lora else "base",
         }
         yield f"data: {json.dumps({'type': 'region_done', 'index': 1, 'total': 1, 'region': region_item}, ensure_ascii=False)}\n\n"
 
@@ -1365,15 +2168,45 @@ app = FastAPI(
     description="FastAPI service for dvdphobia/Khmer-PaddleOCR-VL-LoRA with Smart Hybrid Detection",
     version="1.3.0",
     lifespan=lifespan,
+    docs_url=None if API_ONLY else "/docs",
+    redoc_url=None if API_ONLY else "/redoc",
+    openapi_url=None if API_ONLY else "/openapi.json",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=OCR_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+if API_ONLY:
+    @app.middleware("http")
+    async def require_api_key(request, call_next):
+        # Let CORS handle browser preflight requests. Browsers cannot attach the
+        # x-api-key value to OPTIONS, so checking it here would block Flutter Web.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        if not request.url.path.startswith("/api/"):
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
+
+        expected_key = os.environ.get("OPENKHMER_API_KEY")
+        if not expected_key:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "API key is not configured on the server"},
+            )
+
+        supplied_key = request.headers.get("x-api-key", "")
+        if not hmac.compare_digest(
+            supplied_key.encode("utf-8"), expected_key.encode("utf-8")
+        ):
+            return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
+
+        return await call_next(request)
 
 
 def _read_pil_image(raw_bytes: bytes) -> Image.Image:
@@ -1406,15 +2239,47 @@ async def get_status():
     }
 
 
+def _validate_det_mode(det_mode: str) -> None:
+    if det_mode not in VALID_DET_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown detection mode {det_mode!r}. "
+                f"Expected one of: {', '.join(sorted(VALID_DET_MODES))}"
+            ),
+        )
+
+
+def _select_requested_regions(boxes: list[dict], region_ids: Optional[str]) -> list[dict]:
+    """Restrict OCR to detector-issued IDs when a client explicitly selects regions."""
+    if region_ids is None or region_ids == "":
+        return boxes
+    try:
+        requested = json.loads(region_ids)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="region_ids must be a JSON array.") from exc
+    if not isinstance(requested, list) or any(not isinstance(value, (str, int)) for value in requested):
+        raise HTTPException(status_code=400, detail="region_ids must be a JSON array of IDs.")
+    selected = {str(value) for value in requested}
+    return [box for box in boxes if str(box.get("id", "")) in selected]
+
+
 @app.post("/api/detect")
 async def detect_regions(
     file: UploadFile = File(...),
     det_mode: str = Form("smart_hybrid"),
+    task: str = Form("ocr"),
 ):
+    _validate_det_mode(det_mode)
     raw_bytes = await file.read()
     image = _read_pil_image(raw_bytes)
     try:
-        result = await asyncio.to_thread(detector_engine.detect, image, det_mode)
+        result = await asyncio.to_thread(
+            _cached_detect, image, raw_bytes, det_mode, task
+        )
+        # Preview exactly the regions the matching OCR task will process.
+        result = dict(result)
+        result["boxes"] = _filter_boxes_for_task(result["boxes"], task, image)
         return JSONResponse(content=result)
     except Exception as exc:
         logger.exception("Text detection error")
@@ -1429,6 +2294,7 @@ async def run_ocr(
     max_new_tokens: int = Form(1024),
     use_lora: bool = Form(True),
     det_mode: str = Form("smart_hybrid"),
+    region_ids: Optional[str] = Form(None),
 ):
     if model_manager.status != "ready":
         raise HTTPException(
@@ -1436,101 +2302,81 @@ async def run_ocr(
             detail=f"Model is currently {model_manager.status}: {model_manager.status_message}",
         )
 
+    _validate_det_mode(det_mode)
     raw_bytes = await file.read()
     image = _read_pil_image(raw_bytes)
     prompt_text = _resolve_prompt(task, custom_prompt)
     max_tokens = max(32, min(int(max_new_tokens), 4096))
 
+    def _run_region_ocr():
+        t0 = time.perf_counter()
+        det_res = _cached_detect(image, raw_bytes, det_mode, task)
+        boxes = _filter_boxes_for_task(det_res["boxes"], task, image)
+        boxes = _select_requested_regions(boxes, region_ids)
+        lines: list[str] = []
+        regions: list[dict] = []
+        total_tok = 0
+        for idx, box in enumerate(boxes, start=1):
+            (
+                crop_img,
+                thumb_b64,
+                box_label,
+                box_prompt,
+                budget,
+            ) = model_manager._prepare_region(
+                image, box, prompt_text, max_tokens
+            )
+            res = model_manager._generate_region(
+                crop_img, box_label, box_prompt, budget, use_lora
+            )
+            total_tok += res["tokens"]
+            same_row_as_prev = (
+                idx > 1 and model_manager._same_row_as_prev(boxes[idx - 2], box)
+            )
+            model_manager._append_text_line(
+                lines, regions, res["text"], same_row_as_prev
+            )
+            regions.append(
+                {
+                    "id": box["id"],
+                    "label": box_label,
+                    "score": box.get("score", 1.0),
+                    "bbox": box["bbox"],
+                    "polygon": box["polygon"],
+                    "text": res["text"],
+                    "same_row_as_prev": same_row_as_prev,
+                    "elapsed_ms": res["elapsed_ms"],
+                    "thumb": thumb_b64,
+                    "truncated": res["truncated"],
+                    "error": res["error"],
+                    "adapter": "lora" if res["used_lora"] else "base",
+                }
+            )
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        effective_lora = (
+            any(region["adapter"] == "lora" for region in regions)
+            if regions
+            else use_lora
+        )
+        return {
+            "text": "\n".join(lines),
+            "regions": regions,
+            "prompt": prompt_text,
+            "use_lora": effective_lora,
+            "model_id": LORA_MODEL_ID if effective_lora else BASE_MODEL_ID,
+            "elapsed_ms": elapsed_ms,
+            "det_elapsed_ms": det_res["elapsed_ms"],
+            "det_cached": bool(det_res.get("cached", False)),
+            "tokens": total_tok,
+            "tokens_per_sec": (
+                round(total_tok / (elapsed_ms / 1000.0), 1)
+                if elapsed_ms > 0
+                else 0.0
+            ),
+            "image_size": {"width": image.width, "height": image.height},
+        }
+
     try:
-        if det_mode == "none":
-            crop_img, _ = detector_engine.crop_and_enhance(
-                image, [0, 0, image.width, image.height]
-            )
-            result = await asyncio.to_thread(
-                model_manager.predict,
-                image=crop_img,
-                prompt_text=prompt_text,
-                max_new_tokens=max_tokens,
-                use_lora=use_lora,
-            )
-            return JSONResponse(content=result)
-
-        def _run_region_ocr():
-            t0 = time.perf_counter()
-            det_res = detector_engine.detect(image, mode=det_mode)
-            boxes = det_res["boxes"]
-            lines = []
-            regions = []
-            total_tok = 0
-            page_has_khmer: Optional[bool] = None
-            for box in boxes:
-                box_label = box.get("label", "text_line")
-                crop_img, thumb_b64 = detector_engine.crop_and_enhance(
-                    image, box["bbox"], box_label=box_label
-                )
-                box_prompt = (
-                    LAYOUT_LABEL_TO_PROMPT.get(box_label, prompt_text)
-                    if prompt_text == "OCR:"
-                    else prompt_text
-                )
-                box_use_lora = (
-                    False
-                    if box_label in FORMULA_LABELS
-                    else use_lora
-                )
-                if box_use_lora and box_label != "text_line" and page_has_khmer is False:
-                    box_use_lora = False
-                r = model_manager.predict(
-                    image=crop_img,
-                    prompt_text=box_prompt,
-                    max_new_tokens=min(max_tokens, 384),
-                    use_lora=box_use_lora,
-                )
-                txt = r["text"].strip()
-                if box_use_lora and box_label != "text_line":
-                    if _contains_khmer(txt):
-                        page_has_khmer = True
-                    else:
-                        page_has_khmer = False
-                        r = model_manager.predict(
-                            image=crop_img,
-                            prompt_text=box_prompt,
-                            max_new_tokens=min(max_tokens, 384),
-                            use_lora=False,
-                        )
-                        txt = r["text"].strip()
-                if txt:
-                    lines.append(txt)
-                total_tok += r["tokens"]
-                regions.append(
-                    {
-                        "id": box["id"],
-                        "label": box_label,
-                        "score": box.get("score", 1.0),
-                        "bbox": box["bbox"],
-                        "polygon": box["polygon"],
-                        "text": txt,
-                        "elapsed_ms": r["elapsed_ms"],
-                        "thumb": thumb_b64,
-                    }
-                )
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-            return {
-                "text": "\n".join(lines),
-                "regions": regions,
-                "prompt": prompt_text,
-                "use_lora": use_lora,
-                "model_id": LORA_MODEL_ID if use_lora else BASE_MODEL_ID,
-                "elapsed_ms": elapsed_ms,
-                "tokens": total_tok,
-                "tokens_per_sec": (
-                    round(total_tok / (elapsed_ms / 1000.0), 1)
-                    if elapsed_ms > 0
-                    else 0.0
-                ),
-                "image_size": {"width": image.width, "height": image.height},
-            }
-
         result = await asyncio.to_thread(_run_region_ocr)
         return JSONResponse(content=result)
     except Exception as exc:
@@ -1546,6 +2392,7 @@ async def run_ocr_stream(
     max_new_tokens: int = Form(1024),
     use_lora: bool = Form(True),
     det_mode: str = Form("smart_hybrid"),
+    region_ids: Optional[str] = Form(None),
 ):
     if model_manager.status != "ready":
         raise HTTPException(
@@ -1553,10 +2400,25 @@ async def run_ocr_stream(
             detail=f"Model is currently {model_manager.status}: {model_manager.status_message}",
         )
 
+    _validate_det_mode(det_mode)
     raw_bytes = await file.read()
     image = _read_pil_image(raw_bytes)
     prompt_text = _resolve_prompt(task, custom_prompt)
     max_tokens = max(32, min(int(max_new_tokens), 4096))
+
+    # Detect before sending SSE headers so a detector failure is a real 500
+    # instead of a truncated 200 stream.
+    try:
+        det_result = await asyncio.to_thread(
+            _cached_detect, image, raw_bytes, det_mode, task
+        )
+        det_result = dict(det_result)
+        det_result["boxes"] = _select_requested_regions(
+            _filter_boxes_for_task(det_result["boxes"], task, image), region_ids
+        )
+    except Exception as exc:
+        logger.exception("Text detection error before stream")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return StreamingResponse(
         model_manager.stream_regions_predict(
@@ -1565,6 +2427,8 @@ async def run_ocr_stream(
             max_new_tokens=max_tokens,
             use_lora=use_lora,
             det_mode=det_mode,
+            det_result=det_result,
+            task=task,
         ),
         media_type="text/event-stream",
         headers={
@@ -1714,13 +2578,13 @@ async def export_docx(payload: dict = Body(...)):
     )
 
 
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+if not API_ONLY:
+    os.makedirs("static", exist_ok=True)
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
-@app.get("/")
-async def serve_index():
-    return FileResponse("static/index.html")
+    @app.get("/")
+    async def serve_index():
+        return FileResponse("static/index.html")
 
 
 if __name__ == "__main__":

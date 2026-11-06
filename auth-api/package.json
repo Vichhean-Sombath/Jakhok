@@ -5,6 +5,10 @@
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "local": "node --env-file=.env.local local-server.js",
+    "test": "node test/run.js"
+  },
   "dependencies": {
     "firebase-admin": "^13.5.0",
     "resend": "^6.0.0"
